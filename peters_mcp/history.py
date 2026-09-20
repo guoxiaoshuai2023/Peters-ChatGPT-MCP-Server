@@ -343,9 +343,12 @@ class HistoryAccess:
                 parts = path.relative_to(config["home"]).parts
             except ValueError:
                 parts = path.relative_to(config["home_alias"]).parts
+            # An optional UUID suffix is a storage filename variant, not another
+            # authorized thread. The stored session ID and cwd checks still apply.
+            suffix = r"-" + re.escape(metadata["id"]) + r"(?:_" + ID_PATTERN.pattern + r")?\.jsonl\Z"
             if (len(parts) < 2 or parts[0] not in {"sessions", "archived_sessions"} or
                     any(p in {".", ".."} for p in parts) or
-                    not parts[-1].endswith("-" + metadata["id"] + ".jsonl")):
+                    not re.search(suffix, parts[-1])):
                 raise ValueError()
             fd = os.open(config["home"], DIRECTORY_FLAGS)
             for index, part in enumerate(parts):

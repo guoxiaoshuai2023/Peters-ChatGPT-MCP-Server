@@ -83,6 +83,74 @@ class HistoryTests(unittest.TestCase):
         self.grants[0]["allow_tool_results"] = True
         self.save_config()
 
+    def point_first_rollout(self, path):
+        with sqlite3.connect(self.database) as db:
+            db.execute("UPDATE threads SET rollout_path=? WHERE id=?", (str(path), FIRST))
+
+    def test_uuid_suffixed_rollout_search_and_snapshot_pages(self):
+        for store in ("sessions", "archived_sessions"):
+            with self.subTest(store=store):
+                directory = self.home / store
+                directory.mkdir(exist_ok=True)
+                path = directory / f"rollout-test-{FIRST}_{SECOND}.jsonl"
+                path.write_bytes(encode(self.records))
+                self.point_first_rollout(path)
+                found = self.history.find_codex_threads("最终结论")
+                self.assertEqual([r["thread_id"] for r in found["threads"]], [FIRST])
+                first = self.history.read_codex_thread(FIRST, limit=1)
+                with path.open("ab") as stream:
+                    stream.write(encode([message("later append", native_id="appended")]))
+                second = self.history.read_codex_thread(FIRST, limit=1, cursor=first["next_cursor"])
+                self.assertEqual(first["entries"][0]["text"], "需求：分批读取文档。")
+                self.assertEqual(second["entries"][0]["text"], "公开进度")
+                self.assertEqual(first["snapshot"], second["snapshot"])
+                self.assertTrue(second["appended_since_snapshot"])
+                self.assertNotEqual(first["entries"][0]["message_id"], second["entries"][0]["message_id"])
+
+    def test_rollout_filename_rejects_wrong_identity_and_malformed_suffix(self):
+        names = [f"rollout-test-{SECOND}.jsonl", f"rollout-test-{SECOND}_{FIRST}.jsonl"]
+        names += [f"rollout-test-{FIRST}{suffix}.jsonl" for suffix in (
+            "_", "_not-a-uuid", "_" + SECOND.replace("-", ""),
+            "_AAAAAAAA-AAAA-4AAA-8AAA-AAAAAAAAAAAA", "_" + SECOND + "_" + DENIED,
+            "-" + SECOND, "_" + SECOND + ".backup",
+        )]
+        names += [f"rollout-test-{FIRST}_{SECOND}.jsonl.bak", f"rollout-test-{FIRST}_{SECOND}.jsonl\n"]
+        for name in names:
+            with self.subTest(name=name):
+                path = self.home / "sessions" / name
+                path.write_bytes(encode(self.records))
+                self.point_first_rollout(path)
+                with self.assertRaises(AccessError):
+                    self.history.read_codex_thread(FIRST)
+
+    def test_uuid_suffixed_rollout_still_requires_internal_identity(self):
+        path = self.home / "sessions" / f"rollout-test-{FIRST}_{SECOND}.jsonl"
+        path.write_bytes(encode([record("session_meta", {"id": SECOND}), message("wrong session")]))
+        self.point_first_rollout(path)
+        with self.assertRaises(AccessError):
+            self.history.read_codex_thread(FIRST)
+
+    def test_uuid_suffixed_rollout_rejects_links_and_outside_stores(self):
+        path = self.home / "sessions" / f"rollout-test-{FIRST}_{SECOND}.jsonl"
+        self.point_first_rollout(path)
+        path.symlink_to(self.path)
+        with self.assertRaises(AccessError):
+            self.history.read_codex_thread(FIRST)
+        path.unlink()
+        path.hardlink_to(self.path)
+        with self.assertRaises(AccessError):
+            self.history.read_codex_thread(FIRST)
+        path.unlink()
+        outside = self.home.parent / path.name
+        outside.write_bytes(encode(self.records))
+        alias = self.home / "sessions" / "alias"
+        alias.symlink_to(outside.parent, target_is_directory=True)
+        for target in (outside, alias / path.name, self.home / "sessions" / ".." / ".." / path.name):
+            with self.subTest(target=target):
+                self.point_first_rollout(target)
+                with self.assertRaises(AccessError):
+                    self.history.read_codex_thread(FIRST)
+
     def test_find_same_titles_unique_ids_and_no_cwd_inferred_access(self):
         result = self.history.find_codex_threads("同名任务")
         self.assertEqual({r["thread_id"] for r in result["threads"]}, {FIRST, SECOND})

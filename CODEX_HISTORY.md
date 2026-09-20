@@ -58,6 +58,8 @@
 2. 核验索引指向的 JSONL 位于 `sessions` 或 `archived_sessions` 且会话身份一致，拒绝软链接、多硬链接和特殊文件。
 3. 投影受支持的 `response_item/message`、`event_msg/item_completed` 公共消息格式，并去除镜像副本。
 
+记录文件名支持 `-<thread-id>.jsonl` 和 `-<thread-id>_<uuid>.jsonl` 两种结尾，附加 UUID 仅作为文件名格式处理，不用于推断另一条会话或扩大授权。文件内部身份、全部 cwd、存储路径和快照校验仍须通过；不支持的后缀继续拒绝读取。
+
 服务不启动 Codex 模型或 App Server，不调用 resume、fork、compact、archive、delete 等操作，不附着桌面通信管道，不自动修复存储。SQLite 表结构与 JSONL 格式属于本地兼容实现，不能当作永久公开契约。
 
 数据库缺失、结构不兼容或记录丢失时会报告无法读取，不把失败说成“没有历史”。只有元数据也不会被说成完整空对话。已授权的归档记录可以读取，但必须仍在受支持索引和存储位置。升级 Codex 后若格式改变，可能需要更新适配。

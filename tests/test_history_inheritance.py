@@ -107,6 +107,45 @@ class InheritanceTests(unittest.TestCase):
         self.assertFalse(second['has_more'])
         self.assertEqual(len(self.history.read_codex_thread(FIRST)['entries']), 3)
 
+    def test_suffixed_source_inherits_without_authorizing_the_suffix(self):
+        original = self.thread()
+        path = original.with_name(f'rollout-test-{FIRST}_{SECOND}.jsonl')
+        original.rename(path)
+        with sqlite3.connect(self.db) as db:
+            db.execute('UPDATE threads SET rollout_path=? WHERE id=?', (str(path), FIRST))
+        self.thread(SECOND, self.foreign, extra=[message('FOREIGN_SECRET')])
+        self.settings['denied_threads'] = [SECOND]
+        self.save()
+        found = self.history.find_codex_threads(query='同名任务', project_id='repo')
+        self.assertEqual([r['thread_id'] for r in found['threads']], [FIRST])
+        first = self.history.read_codex_thread(FIRST, limit=1)
+        self.assertEqual(first['thread']['association']['source'], 'repository_inheritance')
+        self.assertEqual(self.settings['threads'], [])
+        second = self.history.read_codex_thread(FIRST, limit=1, cursor=first['next_cursor'])
+        self.assertEqual(second['entries'][0]['text'], 'public final answer')
+        self.assertEqual(first['snapshot'], second['snapshot'])
+        with self.assertRaises(AccessError):
+            self.history.read_codex_thread(SECOND)
+        self.settings['denied_threads'] = [FIRST]
+        self.save()
+        with self.assertRaises(AccessError):
+            self.history.read_codex_thread(FIRST, limit=1, cursor=first['next_cursor'])
+        self.assertEqual(self.history.find_codex_threads()['threads'], [])
+
+    def test_suffixed_source_cannot_inherit_cross_repository_context(self):
+        original = self.thread(contexts=[self.repo, self.foreign], extra=[message('CROSS_SECRET')])
+        path = original.with_name(f'rollout-test-{FIRST}_{SECOND}.jsonl')
+        original.rename(path)
+        with sqlite3.connect(self.db) as db:
+            db.execute('UPDATE threads SET rollout_path=? WHERE id=?', (str(path), FIRST))
+        result = self.history.find_codex_threads()
+        self.assertEqual(result['threads'], [])
+        self.assertTrue(any(w['reason'] == 'recorded_context_missing_foreign_or_cross_project' for w in result['warnings']))
+        for marker in (FIRST, 'CROSS_SECRET', '同名任务'):
+            self.assertNotIn(marker, json.dumps(result, ensure_ascii=False))
+        with self.assertRaises(AccessError):
+            self.history.read_codex_thread(FIRST)
+
     def test_removed_worktree_revokes_read_and_existing_cursor(self):
         self.thread(cwd=self.worktree)
         first = self.history.read_codex_thread(FIRST, limit=1)

@@ -1,0 +1,8 @@
+{
+  "version": 2,
+  "codex_home": "/absolute/path/to/your/.codex",
+  "state_db": "state_5.sqlite",
+  "threads": [],
+  "inherit_projects": false,
+  "denied_threads": []
+}

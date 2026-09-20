@@ -1,5 +1,7 @@
 # Peters ChatGPT MCP Server
 
+开源项目 · [MIT License](LICENSE)
+
 让 ChatGPT 或其他 MCP 客户端按需查阅你指定的本地项目文档和代码，减少反复上传文件的工作。服务运行在存放资料的电脑上；你用配置文件决定开放哪些项目，一套服务可以连接多个 repo，不需要给每个业务 repo 单独开发 MCP。
 
 **clone 只得到程序、测试和配置模板，不会继承任何人的项目目录、仓库身份、Codex 会话授权或云端连接。** 首次使用必须在自己的机器上配置。当前版本：`0.4.0`。
@@ -19,7 +21,7 @@
 
 ### 1. 下载并安装依赖
 
-私有仓库需要先取得 GitHub 访问权限。下面所有命令都在本项目根目录执行：
+仓库公开可 clone，无需申请访问权限。下面所有命令都在本项目根目录执行：
 
 ```sh
 git clone https://github.com/guoxiaoshuai2023/Peters-ChatGPT-MCP-Server.git
@@ -189,3 +191,9 @@ PY
 | 更新代码后游标失效 | 重启会使旧分页游标和候选预览失效，重新读取或准备即可 |
 
 审计默认写入 `work/`，记录操作、成功/失败和来源标识，不记录正文、搜索词或认证令牌。项目及历史配置按请求重新校验；更新 Python 代码后需重启对应服务。
+
+## 参与贡献与许可证
+
+欢迎通过 [Issues](https://github.com/guoxiaoshuai2023/Peters-ChatGPT-MCP-Server/issues) 报告问题，或提交 Pull Request。请使用合成项目提供复现步骤，避免上传真实业务文档、会话记录、本机配置或凭据；行为变更应包含对应验证。
+
+本项目使用 [MIT License](LICENSE)。第三方依赖仍遵循各自的许可证。

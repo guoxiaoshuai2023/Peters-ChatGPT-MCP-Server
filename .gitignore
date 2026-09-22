@@ -11,6 +11,7 @@ deployment/test-project/candidates/chatgpt/*.md
 # Machine-specific authorization and deployment state; commit examples only.
 /projects.json
 /history-access.json
+/delivery-access.json
 /deployment/projects-test.json
 *.local.json
 .env

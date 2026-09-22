@@ -7,6 +7,7 @@ Cloudflare owns OAuth discovery, login and grants. The origin validates its JWT.
 import argparse
 from dataclasses import dataclass
 from datetime import datetime, timezone
+import hashlib
 import json
 import logging
 from logging.handlers import RotatingFileHandler
@@ -22,7 +23,7 @@ from starlette.responses import JSONResponse
 import uvicorn
 
 from .catalog import Catalog
-from .audit import audit_request_id
+from .audit import audit_actor, audit_request_id
 from .history import HistoryAccess
 from .server import create_server
 
@@ -119,9 +120,11 @@ class AccessMiddleware:
             return
         request_id = uuid.uuid4().hex
         context_token = audit_request_id.set(request_id)
+        actor_token = audit_actor.set(None)
         try:
             await self._http(scope, receive, send, request_id)
         finally:
+            audit_actor.reset(actor_token)
             audit_request_id.reset(context_token)
 
     async def _http(self, scope, receive, send, request_id):
@@ -142,7 +145,11 @@ class AccessMiddleware:
             if len(tokens) != 1:
                 raise jwt.InvalidTokenError("Missing or duplicate assertion.")
             token = tokens[0].decode("ascii")
-            await anyio.to_thread.run_sync(self.verifier.verify, token)
+            claims = await anyio.to_thread.run_sync(self.verifier.verify, token)
+            if not isinstance(claims, dict) or any(
+                    not isinstance(claims.get(key), str) or not claims[key] for key in ("iss", "sub")):
+                raise jwt.InvalidTokenError("Verified identity is incomplete.")
+            actor = hashlib.sha256(json.dumps([claims['iss'], claims['sub']], separators=(',', ':')).encode()).hexdigest()
         except (KeySourceUnavailable, jwt.PyJWKClientConnectionError, OSError):
             # A key-source failure must fail closed without asking the user to log in.
             # Ordinary PyJWKClientError also covers an unknown kid: keep that 401.
@@ -173,11 +180,12 @@ class AccessMiddleware:
                 {"error": error, "code": error_code}, status_code=status, headers=headers,
             )(scope, receive, send_with_request_id)
             return
+        audit_actor.set(actor)
         await self.app(scope, receive, send_with_request_id)
 
 
-def build_app(catalog, settings, audit=None, history=None):
-    server = create_server(catalog, audit, history)
+def build_app(catalog, settings, audit=None, history=None, packages=None):
+    server = create_server(catalog, audit, history, packages=packages)
     app = server.streamable_http_app(
         host="127.0.0.1", stateless_http=True, json_response=True,
         max_request_body_size=262144,
@@ -198,6 +206,8 @@ def main():
                         help="Explicit project allowlist; use the synthetic test project first.")
     parser.add_argument("--history-config", type=Path,
                         help="History policy file; absent default history-access.json disables history.")
+    parser.add_argument("--delivery-config", type=Path,
+                        help="Explicit original-file delivery policy; absent delivery-access.json disables package tools.")
     parser.add_argument("--port", type=int, default=8766)
     parser.add_argument("--check", action="store_true")
     args = parser.parse_args()
@@ -212,11 +222,23 @@ def main():
             history_path = default_history
         history = HistoryAccess(history_path, catalog.projects, catalog=catalog)
         history._configuration()
+        default_delivery = base / "delivery-access.json"
+        delivery_path = args.delivery_config
+        if delivery_path is None and (default_delivery.exists() or default_delivery.is_symlink()):
+            delivery_path = default_delivery
+        package_policy = None
+        if delivery_path is not None:
+            from .delivery_policy import DeliveryPolicy
+            package_policy = DeliveryPolicy(delivery_path, catalog)
+            if any(not target['available'] for target in package_policy.capabilities()['targets']):
+                raise ValueError("Configured package targets are unavailable.")
     except (ValueError, TypeError, AttributeError, OSError):
         parser.error("Invalid configuration; check Access settings and project roots.")
     if args.check:
-        print("Access configuration valid. No server or tunnel started.")
+        print("Access configuration valid. Package tools: " +
+              ("configured" if package_policy is not None else "disabled") + ". No server or tunnel started.")
         return
+    packages = None
     audit_dir = base / "work"
     audit_dir.mkdir(exist_ok=True)
     audit = logging.getLogger("peters.remote.audit")
@@ -227,10 +249,15 @@ def main():
     handler.setFormatter(logging.Formatter("%(message)s"))
     audit.addHandler(handler)
     try:
-        uvicorn.run(build_app(catalog, settings, audit, history), host="127.0.0.1", port=args.port,
+        if package_policy is not None:
+            from .delivery_store import DeliveryStore
+            packages = DeliveryStore(package_policy.state_directory, package_policy, audit=audit)
+        uvicorn.run(build_app(catalog, settings, audit, history, packages), host="127.0.0.1", port=args.port,
                     proxy_headers=False, access_log=False, log_level="warning",
                     limit_concurrency=16, timeout_keep_alive=10)
     finally:
+        if packages is not None:
+            packages.close()
         handler.close()
         audit.removeHandler(handler)
 

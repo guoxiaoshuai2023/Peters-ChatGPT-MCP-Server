@@ -10,6 +10,7 @@ from pathlib import Path
 import stat
 import threading
 import time
+import unicodedata
 
 
 class AccessError(ValueError):
@@ -24,6 +25,7 @@ BLOCKED_NAMES = {
     ".git", ".ssh", ".aws", ".azure", ".gnupg", ".npmrc", ".pypirc",
     ".netrc", ".kube", ".git-credentials",
 }
+INTERNAL_DELIVERY_PREFIX = ".peters-mcp-delivery-"
 BLOCKED_PATTERNS = (
     "*.pem", "*.key", "*.p12", "*.pfx", "*.token", "id_rsa", "id_ed25519",
     "credentials.json", "credentials.yaml", "credentials.yml", "credentials.toml",
@@ -55,6 +57,11 @@ MAX_SEARCH_SECONDS = 10
 DIRECTORY_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
 
 
+def private_path_key(path):
+    """Conservatively match case and canonical Unicode filesystem aliases."""
+    return tuple(unicodedata.normalize('NFC', part.casefold()) for part in Path(path).parts)
+
+
 @dataclass(frozen=True)
 class Project:
     id: str
@@ -84,6 +91,22 @@ class Catalog:
         self._config_path = None
         self._config_digest = None
         self._refresh_lock = threading.RLock()
+        # Service state stays private even when live project/worktree grants grow.
+        self._private_trees = frozenset()
+
+    def protect_private_tree(self, path):
+        """Reserve an internal tree for this catalog's lifetime; never client supplied."""
+        with self._refresh_lock:
+            self._private_trees = self._private_trees | {Path(path).resolve()}
+
+    def _check_private_tree(self, path):
+        # Conservative case folding also covers case-insensitive filesystems.
+        parts = private_path_key(path)
+        for root in self._private_trees:
+            prefix = private_path_key(root)
+            if parts[:len(prefix)] == prefix:
+                raise AccessError("Service-owned state is not a project read source.",
+                                  code="delivery_private_staging")
 
     def refresh(self):
         """Policy changes apply without retaining stale project grants."""
@@ -159,6 +182,7 @@ class Catalog:
         if not isinstance(path, str) or len(path) > 4096:
             raise AccessError("[invalid_path] Invalid relative path.")
         if allow_root and path in ("", "."):
+            self._check_private_tree(project.root)
             return ()
         parts = tuple(path.split("/"))
         if any(not p or p in (".", "..") or "\\" in p or any(ord(c) < 32 for c in p)
@@ -166,6 +190,11 @@ class Catalog:
             raise AccessError("[invalid_path] Use a relative path without traversal or control characters.")
         for i, part in enumerate(parts):
             lower = part.casefold()
+            internal_id = lower.removeprefix(INTERNAL_DELIVERY_PREFIX)
+            if (lower.startswith(INTERNAL_DELIVERY_PREFIX) and len(internal_id) == 32
+                    and all(c in "0123456789abcdef" for c in internal_id)):
+                raise AccessError("Service-owned publication staging is not a project read source.",
+                                  code="delivery_private_staging")
             lowered = tuple(p.casefold() for p in parts[:i + 1])
             if any(len(lowered) >= len(pattern) and lowered[-len(pattern):] == pattern for pattern in AUTH_PATHS):
                 raise AccessError("[sensitive_source] Local authentication state is excluded.")
@@ -179,6 +208,7 @@ class Catalog:
             if any(fnmatchcase(prefix.casefold(), pattern.casefold()) or
                    fnmatchcase(lower, pattern.casefold()) for pattern in project.exclude):
                 raise AccessError("[configured_exclusion] Path excluded by project configuration.")
+        self._check_private_tree(project.root.joinpath(*parts))
         return parts
 
     @contextmanager
@@ -186,6 +216,7 @@ class Catalog:
         """Open each component relative to a directory descriptor; never follow links."""
         fd = None
         try:
+            self._check_private_tree(project.root.joinpath(*parts))
             fd = os.open(project.root, DIRECTORY_FLAGS)
             opened = os.fstat(fd)
             if project.root_identity and (opened.st_dev, opened.st_ino) != project.root_identity:

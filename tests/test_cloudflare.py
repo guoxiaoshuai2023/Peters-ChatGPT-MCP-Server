@@ -1,6 +1,7 @@
 import asyncio
 from dataclasses import replace
 import io
+import hashlib
 import json
 import logging
 import time
@@ -15,7 +16,7 @@ import jwt
 from starlette.responses import JSONResponse
 
 from peters_mcp.cloudflare import AccessMiddleware, AccessSettings, AccessVerifier
-from peters_mcp.audit import audit_request_id
+from peters_mcp.audit import audit_actor, audit_request_id
 
 
 class CloudflareTests(unittest.TestCase):
@@ -286,6 +287,29 @@ class CloudflareTests(unittest.TestCase):
             self.assertEqual(record["status_code"], 200)
             self.assertIsNone(record["error_code"])
         self.assertIsNone(audit_request_id.get())
+
+    def test_actor_is_derived_only_from_verified_identity_and_reset(self):
+        seen = []
+        async def app(scope, receive, send):
+            seen.append((audit_actor.get(), await anyio.to_thread.run_sync(audit_actor.get)))
+            await JSONResponse({"ok": True})(scope, receive, send)
+        middleware = AccessMiddleware(app, self.verifier)
+        async def run():
+            outer = audit_actor.set("untrusted-inherited-actor")
+            try:
+                good = await self.request(middleware, self.token())
+                denied = await self.request(middleware, "invalid")
+                self.assertEqual(audit_actor.get(), "untrusted-inherited-actor")
+                return good, denied
+            finally:
+                audit_actor.reset(outer)
+        good, denied = asyncio.run(run())
+        expected = hashlib.sha256(json.dumps([self.settings.team_domain, self.claims['sub']],
+                                              separators=(',', ':')).encode()).hexdigest()
+        self.assertEqual(seen, [(expected, expected)])
+        self.assertEqual(good[0]['status'], 200)
+        self.assertEqual(denied[0]['status'], 401)
+        self.assertIsNone(audit_actor.get())
 
     def test_unexpected_verifier_error_is_not_logged_as_success(self):
         verifier = Mock()

@@ -4,7 +4,9 @@
 
 让 ChatGPT 或其他 MCP 客户端按需查阅你指定的本地项目文档和代码，减少反复上传文件的工作。服务运行在存放资料的电脑上；你用配置文件决定开放哪些项目，一套服务可以连接多个 repo，不需要给每个业务 repo 单独开发 MCP。
 
-**clone 只得到程序、测试和配置模板，不会继承任何人的项目目录、仓库身份、Codex 会话授权或云端连接。** 首次使用必须在自己的机器上配置。当前版本：`0.4.0`。
+**clone 只得到程序、测试和配置模板，不会继承任何人的项目目录、仓库身份、Codex 会话授权或云端连接。** 首次使用必须在自己的机器上配置。当前版本：`0.5.0`。
+
+0.5.0 新增默认关闭的[原文件包交付](PACKAGE_DELIVERY.md)：原生 ZIP 附件、持久暂存、完整清单确认、独立版本目录发布和回读校验。它需要额外配置写入目标与文件来源，不会自动扩展既有权限；旧的 48 KiB 候选 Markdown 接口保持原语义。
 
 ## 它能做什么
 
@@ -21,7 +23,7 @@
 
 ### 1. 下载并安装依赖
 
-仓库公开可 clone，无需申请访问权限。下面所有命令都在本项目根目录执行：
+按仓库当前可见性准备相应的 GitHub 访问权限。下面所有命令都在本项目根目录执行：
 
 ```sh
 git clone https://github.com/guoxiaoshuai2023/Peters-ChatGPT-MCP-Server.git
@@ -153,10 +155,16 @@ PY
 | `read_codex_thread_item` | 读取另行授权的单条工具证据 |
 | `prepare_candidate` | 预览候选文档 |
 | `save_candidate` | 确认后新建候选 Markdown |
+| `get_delivery_capabilities` | 可选：查看原文件包的明确写入目标及限额 |
+| `stage_file_package` | 可选：经确认将原生 ZIP 接收到私有暂存 |
+| `inspect_delivery` | 可选：查看持久交付状态、冻结清单及原文件预览 |
+| `commit_delivery` | 可选：用户确认后发布完整的新版本目录 |
+
+最后四项仅在受认证入口单独配置文件包交付后提供；默认配置仍是原有十个工具。
 
 三个文件查询工具支持可选 `worktree_id`，从 `list_worktrees` 获取。省略时使用配置的默认目录。工作目录 ID `main` 不代表当前分支必然名为 main；HEAD 也不能代替工作副本文件哈希。
 
-单文件最大 8 MiB，单次最多 40,000 字符。用 `next_offset` 和 `expected_sha256` 继续读取文件；历史用原参数和 `next_cursor` 继续。搜索受时间和大小预算限制，应检查 `complete`/跳过提示。缓存目录默认不递归搜索，可用 `include_caches=true` 纳入。
+普通 `read_file` 单文件最大 8 MiB，单次最多 40,000 字符。用 `next_offset` 和 `expected_sha256` 继续读取文件；历史用原参数和 `next_cursor` 继续。原文件包使用独立的暂存、预览和字节哈希核验限额，不受旧文本读取上限代替验收。搜索受时间和大小预算限制，应检查 `complete`/跳过提示。缓存目录默认不递归搜索，可用 `include_caches=true` 纳入。
 
 ## 本机配置与 Git 的边界
 
@@ -165,6 +173,7 @@ PY
 | `*.example.json` | 需要自行填写的通用模板 | 是 |
 | `projects.json` | 本机目录、repo 身份和候选目录授权 | 否 |
 | `history-access.json` | 本机 Codex 目录、会话授权与撤销 | 否 |
+| `delivery-access.json` | 原文件包写入目标、来源及私有暂存策略 | 否 |
 | `deployment/projects-test.json` | 本机合成测试目录 | 否 |
 | `deployment/*.local.json`、`*.token` | 身份配置、部署状态与令牌 | 否 |
 | `.venv/`、`work/`、`tools/cloudflared` | 依赖、审计/运行数据和本机二进制 | 否 |

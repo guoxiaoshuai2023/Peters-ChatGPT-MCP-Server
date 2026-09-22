@@ -97,7 +97,7 @@ class ProtocolTests(unittest.TestCase):
                                   "mcp.example.com", ("owner@example.com",))
         app = build_app(catalog, settings, audit)
         # Signature/identity rejection is covered separately with generated RSA keys.
-        app.verifier.verify = Mock(return_value={"sub": "synthetic"})
+        app.verifier.verify = Mock(return_value={"iss": settings.team_domain, "sub": "synthetic"})
         headers = {"Accept": "application/json, text/event-stream",
                    "cf-access-jwt-assertion": "SYNTHETIC_ASSERTION"}
         with TestClient(app, base_url="http://127.0.0.1:8766") as client:

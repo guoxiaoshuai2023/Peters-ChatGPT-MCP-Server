@@ -9,13 +9,16 @@ import sys
 import tempfile
 import time
 import unittest
+from unittest.mock import Mock
 from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
 from mcp import StdioServerParameters
 from mcp.client import Client
+from starlette.testclient import TestClient
 
 from peters_mcp.catalog import Catalog, Project
+from peters_mcp.cloudflare import AccessSettings, build_app
 from peters_mcp.server import create_server
 
 
@@ -81,6 +84,42 @@ class ProtocolTests(unittest.TestCase):
         self.assertNotIn("needle", stream.getvalue())
         self.assertNotIn("outside", stream.getvalue())
         self.assertNotIn("中文", stream.getvalue())
+
+    def test_authenticated_http_tool_error_has_correlated_safe_audit(self):
+        candidate_dir = self.repo / "docs/candidates/chatgpt"
+        candidate_dir.mkdir(parents=True)
+        catalog = Catalog([Project("demo", "Demo", self.repo,
+                                   candidate_directory="docs/candidates/chatgpt")])
+        logs = io.StringIO()
+        audit = logging.Logger("test.http.audit")
+        audit.addHandler(logging.StreamHandler(logs))
+        settings = AccessSettings("https://test-team.cloudflareaccess.com", "a" * 64,
+                                  "mcp.example.com", ("owner@example.com",))
+        app = build_app(catalog, settings, audit)
+        # Signature/identity rejection is covered separately with generated RSA keys.
+        app.verifier.verify = Mock(return_value={"sub": "synthetic"})
+        headers = {"Accept": "application/json, text/event-stream",
+                   "cf-access-jwt-assertion": "SYNTHETIC_ASSERTION"}
+        with TestClient(app, base_url="http://127.0.0.1:8766") as client:
+            initialized = client.post("/mcp", headers=headers, json={"jsonrpc": "2.0", "id": 1,
+                "method": "initialize", "params": {"protocolVersion": "2025-11-25", "capabilities": {},
+                "clientInfo": {"name": "synthetic-test", "version": "1"}}})
+            self.assertEqual(initialized.status_code, 200)
+            response = client.post("/mcp", headers={**headers, "MCP-Protocol-Version": "2025-11-25"},
+                json={"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {
+                    "name": "prepare_candidate", "arguments": {"project_id": "demo",
+                        "filename": "PRIVATE_FILENAME with space.md", "markdown": "PRIVATE_DOCUMENT"}}})
+        self.assertTrue(response.json()['result']['isError'])
+        records = [json.loads(line) for line in logs.getvalue().splitlines()]
+        related = [r for r in records if r.get('request_id') == response.headers['X-Request-ID']]
+        self.assertEqual(len(related), 2)
+        self.assertEqual(related[0]['event'], 'access_check')
+        self.assertTrue(related[0]['ok'])
+        self.assertEqual(related[1]['error_code'], 'candidate_filename_invalid')
+        self.assertFalse(related[1]['ok'])
+        for marker in ('SYNTHETIC_ASSERTION', 'PRIVATE_FILENAME', 'PRIVATE_DOCUMENT'):
+            self.assertNotIn(marker, logs.getvalue())
+        self.assertFalse(list(candidate_dir.iterdir()))
 
     def test_stdio_subprocess(self):
         async def run():

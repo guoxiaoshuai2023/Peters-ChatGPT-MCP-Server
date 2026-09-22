@@ -6,11 +6,14 @@ Cloudflare owns OAuth discovery, login and grants. The origin validates its JWT.
 
 import argparse
 from dataclasses import dataclass
+from datetime import datetime, timezone
 import json
 import logging
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 import re
+import time
+import uuid
 
 import anyio
 import jwt
@@ -19,6 +22,7 @@ from starlette.responses import JSONResponse
 import uvicorn
 
 from .catalog import Catalog
+from .audit import audit_request_id
 from .history import HistoryAccess
 from .server import create_server
 
@@ -93,22 +97,63 @@ class AccessMiddleware:
             if scope["type"] == "websocket":
                 await send({"type": "websocket.close", "code": 1008})
             return
+        request_id = uuid.uuid4().hex
+        context_token = audit_request_id.set(request_id)
+        try:
+            await self._http(scope, receive, send, request_id)
+        finally:
+            audit_request_id.reset(context_token)
+
+    async def _http(self, scope, receive, send, request_id):
+        started = time.monotonic()
+
+        async def send_with_request_id(message):
+            if message["type"] == "http.response.start":
+                message = {**message, "headers": [
+                    (name, value) for name, value in message.get("headers", [])
+                    if name.lower() != b"x-request-id"
+                ] + [(b"x-request-id", request_id.encode("ascii"))]}
+            await send(message)
+
         tokens = [value for name, value in scope.get("headers", [])
                   if name.lower() == b"cf-access-jwt-assertion"]
+        status, error_code = 200, None
         try:
             if len(tokens) != 1:
                 raise jwt.InvalidTokenError("Missing or duplicate assertion.")
             token = tokens[0].decode("ascii")
             await anyio.to_thread.run_sync(self.verifier.verify, token)
-        except (jwt.PyJWTError, UnicodeDecodeError, ValueError, OSError):
+        except (jwt.PyJWKClientConnectionError, OSError):
+            # A key-fetch outage must fail closed without asking the user to log in.
+            # Ordinary PyJWKClientError also covers an unknown kid: keep that 401.
+            status, error_code = 503, "authentication_unavailable"
+        except (jwt.PyJWTError, UnicodeDecodeError, ValueError):
+            status, error_code = 401, "authentication_required"
+        except Exception:
+            status, error_code = 500, "authentication_internal_error"
+        finally:
             if self.audit:
-                self.audit.info(json.dumps({"event": "access_denied"}))
+                self.audit.info(json.dumps({
+                    "time": datetime.now(timezone.utc).isoformat(),
+                    "event": "access_check", "request_id": request_id,
+                    "ok": status == 200, "error_code": error_code,
+                    "status_code": status,
+                    "elapsed_ms": round((time.monotonic() - started) * 1000),
+                }))
+        if status != 200:
+            headers = {"Cache-Control": "no-store"}
+            if status == 503:
+                headers["Retry-After"] = "5"
+            error = {
+                401: "Cloudflare Access authentication required.",
+                503: "Authentication verification temporarily unavailable. Retry later.",
+                500: "Authentication verification failed internally. Contact the service operator.",
+            }[status]
             await JSONResponse(
-                {"error": "Cloudflare Access authentication required."}, status_code=401,
-                headers={"Cache-Control": "no-store"},
-            )(scope, receive, send)
+                {"error": error, "code": error_code}, status_code=status, headers=headers,
+            )(scope, receive, send_with_request_id)
             return
-        await self.app(scope, receive, send)
+        await self.app(scope, receive, send_with_request_id)
 
 
 def build_app(catalog, settings, audit=None, history=None):

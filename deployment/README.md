@@ -115,3 +115,23 @@ Linux 可前台运行相同 origin 与 tunnel；仓库的 LaunchAgent 管理脚�
 `access.local.json`、`cloudflare.token`、`projects-test.json`、根目录项目/历史配置、`work/` 日志和 `tools/cloudflared` 都属于本机运行材料，已被 `.gitignore` 排除。不要强制提交，也不要把它们复制成带真实数据的“示例”。
 
 源码更新需要重启 origin；权限配置按请求重新校验。重启会使未使用的候选准备凭据及历史分页游标失效，重新生成即可。部署在新机器上不会访问原机器的磁盘；应重新配置 repo 身份、目录、域名与认证。
+
+## 网络中断与授权到期的区分
+
+本机 origin 将缺失、失效、伪造签名或不符合身份白名单的凭证返回为 `401 / authentication_required`。公钥获取的连接故障返回 `503 / authentication_unavailable` 和 `Retry-After: 5`，仍拒绝执行工具；这种故障应等待网络恢复，不应据此撤销用户授权。未识别的公钥内容错误仍可能沿用认证错误分类，不能声称所有上游错误都已自动识别。
+
+认证阶段记录 `event=access_check`、时间、`request_id`、状态和错误码；每次工具调用有自己的 `call_id`，HTTP 调用会带关联的 `request_id`。响应头返回 `X-Request-ID`。日志不包含 JWT、邮箱、正文、搜索词或异常详情。认证阶段 `status_code=200` 只表示凭证校验成功，仍须核对工具审计。
+
+若 502 与隧道 QUIC/UDP 超时同时出现，可以在**独立合成测试实例**中对照 QUIC 与 HTTP/2；不要关闭全局代理，或把代理 fake-IP 的出现直接判为 DNS 故障。短期测试通过不代表已证明长期稳定。参考 [Cloudflare 随机断连排查](https://developers.cloudflare.com/cloudflare-one/networks/connectors/cloudflare-tunnel/troubleshoot-tunnels/common-errors/#my-tunnel-randomly-disconnects)。
+
+确认切换窗口后，可显式选择登录服务的隧道协议：
+
+```sh
+.venv/bin/python deployment/manage_services.py install --projects real --tunnel-protocol http2
+```
+
+该命令会重载 **origin 和 tunnel 两个服务**，会使旧分页游标和候选预览失效，应先协调时机。默认协议为 `auto`；恢复默认时也须明确安排切换。不要在生产隧道上启动指向测试实例的同名副本，那会分流真实请求。
+
+每天重新登录还应检查 Managed OAuth 的 **Grant session duration**，它控制刷新令牌的有效期，与默认 15 分钟的短期 access token 不同。可在明确同意后将 grant 设为 1 周，同时保留短期 token、原白名单和认证机制；不通过全局 revoke 或永久 token 来验证。旧 grant 是否应用新期限不能仅凭设置页面断定，应观察新授权的实际续期。参考 [Cloudflare Managed OAuth](https://developers.cloudflare.com/cloudflare-one/access-controls/applications/http-apps/managed-oauth/#managed-oauth-settings)。
+
+验证记录须分别说明：短期 token 到期后的自动续期、超过原 24 小时窗口后的访问、最终 grant 到期后的重新认证。当日检查成功不能证明跨天验证通过。网页验证只使用新建的专用会话和合成项目，写入由用户在客户端按次确认。

@@ -3,6 +3,7 @@
 from datetime import datetime, timezone
 import json
 import logging
+import secrets
 import time
 
 from mcp.server.mcpserver import MCPServer
@@ -10,6 +11,7 @@ from mcp.server.mcpserver.exceptions import ToolError
 from mcp.types import ToolAnnotations
 
 from .catalog import AccessError, Catalog
+from .audit import audit_request_id
 from .candidates import CandidateDelivery
 from .history import HistoryAccess
 
@@ -48,19 +50,28 @@ def create_server(catalog: Catalog, audit: logging.Logger | None = None, history
     def invoke(operation, **arguments):
         started = time.monotonic()
         ok = False
+        error_code = None
+        call_id = secrets.token_hex(8)
         try:
             target = history if operation in history_tools else (delivery if operation in {"prepare_candidate", "save_candidate"} else catalog)
             result = getattr(target, operation)(**arguments)
             ok = True
             return result
         except AccessError as exc:
+            error_code = exc.code
             raise ToolError(str(exc)) from None
         except Exception:
+            error_code = "internal_error"
             raise ToolError("Unexpected local operation failure. Check the server configuration.") from None
         finally:
             if audit:
                 record = {"time": datetime.now(timezone.utc).isoformat(), "tool": operation,
-                          "ok": ok, "elapsed_ms": round((time.monotonic() - started) * 1000)}
+                          "ok": ok, "call_id": call_id,
+                          "elapsed_ms": round((time.monotonic() - started) * 1000)}
+                if audit_request_id.get() is not None:
+                    record["request_id"] = audit_request_id.get()
+                if error_code is not None:
+                    record["error_code"] = error_code
                 project_id = arguments.get("project_id")
                 if project_id in catalog.projects:
                     record["project"] = project_id

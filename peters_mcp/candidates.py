@@ -27,7 +27,8 @@ def publish_exclusive(directory_fd, temporary_name, filename):
     try:
         rename = getattr(libc, name)
     except AttributeError:
-        raise AccessError("Atomic create-only publication is unsupported on this platform.") from None
+        raise AccessError("Atomic create-only publication is unsupported on this platform.",
+                          code="candidate_platform_unsupported") from None
     rename.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_uint]
     rename.restype = ctypes.c_int
     if rename(directory_fd, os.fsencode(temporary_name), directory_fd, os.fsencode(filename), flag):
@@ -48,30 +49,34 @@ class CandidateDelivery:
         self.catalog.check_write_root(project)
         directory = project.candidate_directory
         if directory is None:
-            raise AccessError("Candidate delivery is not enabled for this project.")
+            raise AccessError("Candidate delivery is not enabled for this project.", code="candidate_delivery_disabled")
         parts = self.catalog.parts(project, path)
         dir_parts = self.catalog.parts(project, directory)
         if parts[:-1] != dir_parts:
-            raise AccessError("Write target must be directly inside the configured candidate directory.")
+            raise AccessError("Write target must be directly inside the configured candidate directory.",
+                              code="candidate_target_rejected")
         filename = parts[-1]
+        segments = filename[:-3].split(".")
         if (not filename.endswith(".md") or len(filename.encode("utf-8")) > 160 or
-                not filename[:-3] or not all(c.isalnum() or c in "-_" for c in filename[:-3]) or
+                not all(segment and all(c.isalnum() or c in "-_" for c in segment) for segment in segments) or
                 filename.casefold() in {"agents.md", "claude.md", "skill.md"}):
-            raise AccessError("Use a .md filename with letters, digits, - or _; rule filenames are forbidden.")
+            raise AccessError("Use a .md filename with letters, digits, - or _, optionally separated by single dots "
+                              "(for example plan-v2.1.md); rule filenames are forbidden.",
+                              code="candidate_filename_invalid")
         return project, dir_parts, filename
 
     @staticmethod
     def _bytes(document):
         if not isinstance(document, str) or not document.strip():
-            raise AccessError("A nonempty Markdown document is required.")
+            raise AccessError("A nonempty Markdown document is required.", code="candidate_document_invalid")
         if any(ord(c) < 32 and c not in "\n\r\t" for c in document):
-            raise AccessError("Control characters are not allowed in candidate documents.")
+            raise AccessError("Control characters are not allowed in candidate documents.", code="candidate_document_invalid")
         try:
             raw = document.encode("utf-8")
         except UnicodeError:
-            raise AccessError("Document must be valid UTF-8.") from None
+            raise AccessError("Document must be valid UTF-8.", code="candidate_document_invalid") from None
         if len(raw) > MAX_DOCUMENT_BYTES:
-            raise AccessError("Candidate document exceeds 48 KiB.")
+            raise AccessError("Candidate document exceeds 48 KiB.", code="candidate_document_too_large")
         return raw
 
     @staticmethod
@@ -93,12 +98,13 @@ class CandidateDelivery:
                 raise ValueError()
             return json.loads(base64.b64decode(body, altchars=b"-_", validate=True))
         except (ValueError, UnicodeError):
-            raise AccessError("Invalid preparation or server restarted. Prepare and review again.") from None
+            raise AccessError("Invalid preparation or server restarted. Prepare and review again.",
+                              code="candidate_preview_invalid") from None
 
     def prepare_candidate(self, project_id, filename, markdown):
         project = self.catalog.project(project_id)
         if project.candidate_directory is None:
-            raise AccessError("Candidate delivery is not enabled for this project.")
+            raise AccessError("Candidate delivery is not enabled for this project.", code="candidate_delivery_disabled")
         path = f"{project.candidate_directory}/{filename}"
         project, parts, filename = self._target(project_id, path)
         self._bytes(markdown)
@@ -118,7 +124,8 @@ class CandidateDelivery:
             except FileNotFoundError:
                 pass
             else:
-                raise AccessError("Target already exists. Choose a new filename; nothing was changed.")
+                raise AccessError("Target already exists. Choose a new filename; nothing was changed.",
+                                  code="candidate_target_exists")
             identity = self._identity(fd)
         expires = int(time.time()) + PREVIEW_SECONDS
         payload = {"project": project_id, "root": str(project.root), "repository_id": project.repository_id, "path": path,
@@ -148,13 +155,13 @@ class CandidateDelivery:
         except FileNotFoundError:
             return False
         if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1 or info.st_size != len(raw):
-            raise AccessError("Target exists or changed. It will never be overwritten.")
+            raise AccessError("Target exists or changed. It will never be overwritten.", code="candidate_target_changed")
         reader = os.open(filename, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=fd)
         try:
             before = os.fstat(reader)
             if (not stat.S_ISREG(before.st_mode) or before.st_nlink != 1 or
                     (before.st_dev, before.st_ino) != (info.st_dev, info.st_ino)):
-                raise AccessError("Target changed during verification.")
+                raise AccessError("Target changed during verification.", code="candidate_target_changed")
             chunks, count = [], 0
             while count <= len(raw):
                 chunk = os.read(reader, min(65536, len(raw) + 1 - count))
@@ -167,7 +174,8 @@ class CandidateDelivery:
             def version(info):
                 return (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns, info.st_nlink)
             if b"".join(chunks) != raw or version(before) != version(after) or version(current) != version(after):
-                raise AccessError("Target exists with different or changing contents; no overwrite.")
+                raise AccessError("Target exists with different or changing contents; no overwrite.",
+                                  code="candidate_target_changed")
             return True
         finally:
             os.close(reader)
@@ -176,7 +184,8 @@ class CandidateDelivery:
         self.catalog.check_write_root(project)
         with self.catalog.open_path(project, parts, directory=True) as current_fd:
             if self._identity(current_fd) != self._identity(fd):
-                raise AccessError("Candidate directory changed during delivery; inspect the outcome before retrying.")
+                raise AccessError("Candidate directory changed during delivery; inspect the outcome before retrying.",
+                                  code="candidate_directory_changed")
 
     def save_candidate(self, project_id, path, document, sha256, preparation):
         project, parts, filename = self._target(project_id, path)
@@ -186,20 +195,23 @@ class CandidateDelivery:
         if any(payload.get(k) != v for k, v in {
             "project": project_id, "root": str(project.root), "repository_id": project.repository_id, "path": path, "sha256": digest
         }.items()) or sha256 != digest:
-            raise AccessError("Project, path or document differs from the preview. Prepare and review again.")
+            raise AccessError("Project, path or document differs from the preview. Prepare and review again.",
+                              code="candidate_preview_mismatch")
         with self._lock, self.catalog.open_path(project, parts, directory=True) as fd:
             if self._identity(fd) != payload["directory_identity"]:
-                raise AccessError("Candidate directory changed since preview. Prepare again.")
+                raise AccessError("Candidate directory changed since preview. Prepare again.", code="candidate_directory_changed")
             delivery_id = payload["delivery_id"]
             if self._existing(fd, filename, raw):
                 self._check_directory(project, parts, fd)
                 return self._receipt(project, path, payload, "already_saved")
             if delivery_id in self._attempts:
-                raise AccessError("A previous attempt has no matching file. Do not recreate it on retry; review again.")
+                raise AccessError("A previous attempt has no matching file. Do not recreate it on retry; review again.",
+                                  code="candidate_outcome_uncertain")
             if time.time() >= payload["expires"]:
-                raise AccessError("Preview expired. Prepare and review again.")
+                raise AccessError("Preview expired. Prepare and review again.", code="candidate_preview_expired")
             if len(self._attempts) >= 4096:
-                raise AccessError("Delivery capacity reached; restart the service and prepare again.")
+                raise AccessError("Delivery capacity reached; restart the service and prepare again.",
+                                  code="candidate_capacity_exhausted")
             # Remember attempts, even if I/O fails: a late failure must not recreate a deleted file.
             self._attempts.add(delivery_id)
             temporary = ".peters-candidate-" + secrets.token_hex(16) + ".tmp"
@@ -220,24 +232,27 @@ class CandidateDelivery:
                 written = os.fstat(writer)
                 if (not stat.S_ISREG(staged.st_mode) or staged.st_nlink != 1 or
                         (staged.st_dev, staged.st_ino) != (written.st_dev, written.st_ino)):
-                    raise AccessError("Staging file changed. Delivery refused.")
+                    raise AccessError("Staging file changed. Delivery refused.", code="candidate_staging_changed")
                 publish_exclusive(fd, temporary, filename)
                 os.fsync(fd)
                 final = os.stat(filename, dir_fd=fd, follow_symlinks=False)
                 if (final.st_dev, final.st_ino) != (written.st_dev, written.st_ino):
-                    raise AccessError("Published file identity changed; inspect outcome. No success claimed.")
+                    raise AccessError("Published file identity changed; inspect outcome. No success claimed.",
+                                      code="candidate_outcome_uncertain")
                 if not self._existing(fd, filename, raw):
-                    raise AccessError("Published file disappeared; no success claimed. Inspect the outcome.")
+                    raise AccessError("Published file disappeared; no success claimed. Inspect the outcome.",
+                                      code="candidate_outcome_uncertain")
                 self._check_directory(project, parts, fd)
                 return self._receipt(project, path, payload, "saved")
             except FileExistsError:
                 if self._existing(fd, filename, raw):
                     self._check_directory(project, parts, fd)
                     return self._receipt(project, path, payload, "already_saved")
-                raise AccessError("Target appeared after preview. No overwrite.") from None
+                raise AccessError("Target appeared after preview. No overwrite.", code="candidate_target_exists") from None
             except OSError:
                 raise AccessError("Delivery I/O failed; outcome may be uncertain. Retry the exact same "
-                                  "save_arguments to verify, or inspect the target before preparing again.") from None
+                                  "save_arguments to verify, or inspect the target before preparing again.",
+                                  code="candidate_io_error") from None
             finally:
                 if writer is not None:
                     os.close(writer)

@@ -26,12 +26,15 @@ def unload_service(user_domain, label):
         time.sleep(0.2)
 
 
-def service_definitions(project_config):
+def service_definitions(project_config, tunnel_protocol="auto"):
+    if tunnel_protocol not in {"auto", "quic", "http2"}:
+        raise ValueError("Unsupported tunnel protocol.")
     commands = [
         [str(BASE / ".venv/bin/python"), "-m", "peters_mcp.cloudflare",
          "--access-config", str(BASE / "deployment/access.local.json"),
          "--config", str(project_config), "--port", "8766"],
-        [str(BASE / "tools/cloudflared"), "tunnel", "--no-autoupdate", "--loglevel", "warn",
+        [str(BASE / "tools/cloudflared"), "tunnel", "--protocol", tunnel_protocol,
+         "--no-autoupdate", "--loglevel", "warn",
          "run", "--token-file", str(BASE / "deployment/cloudflare.token")],
     ]
     return [{"Label": label, "ProgramArguments": command, "WorkingDirectory": str(BASE),
@@ -46,13 +49,15 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("action", choices=("install", "stop", "uninstall", "status"))
     parser.add_argument("--projects", choices=("test", "real"), default="test")
+    parser.add_argument("--tunnel-protocol", choices=("auto", "quic", "http2"), default="auto",
+                        help="Transport used on install; default auto. Changing it restarts the tunnel.")
     args = parser.parse_args()
     if sys.platform != "darwin":
         parser.error("This service helper requires macOS.")
     user_domain = f"gui/{os.getuid()}"
     agent_dir = Path.home() / "Library" / "LaunchAgents"
     project_config = BASE / ("deployment/projects-test.json" if args.projects == "test" else "projects.json")
-    definitions = service_definitions(project_config)
+    definitions = service_definitions(project_config, args.tunnel_protocol)
     paths = [agent_dir / (label + ".plist") for label in LABELS]
 
     if args.action == "status":

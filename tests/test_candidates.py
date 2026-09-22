@@ -1,7 +1,9 @@
 import asyncio
 from concurrent.futures import ThreadPoolExecutor
 import hashlib
+import io
 import json
+import logging
 import os
 from pathlib import Path
 import tempfile
@@ -13,6 +15,7 @@ from mcp.client import Client
 from peters_mcp.catalog import AccessError, Catalog, Project
 from peters_mcp.candidates import CandidateDelivery, MAX_DOCUMENT_BYTES, publish_exclusive
 from peters_mcp.server import create_server
+from peters_mcp.audit import audit_request_id
 
 
 class CandidateTests(unittest.TestCase):
@@ -68,6 +71,68 @@ class CandidateTests(unittest.TestCase):
         args = self.prepare()
         with self.assertRaises(AccessError):
             self.delivery.save_candidate(**{**args, "path": "README.md"})
+
+    def test_versioned_filenames_keep_path_and_rule_restrictions(self):
+        for name in (".hidden.md", "plan..v1.md", "plan..md", "plan.v1/.md", "../plan-v1.0.md",
+                     "AGENTS.md", "CLAUDE.md", "SKILL.md", "plan v1.0.md"):
+            with self.subTest(name=name), self.assertRaises(AccessError):
+                self.prepare(name)
+        for name in ("plan-v2.1.md", "research-v1.0.3.md", "研究方案-v2.1.md"):
+            with self.subTest(name=name):
+                args = self.prepare(name)
+                saved = self.delivery.save_candidate(**args)
+                self.assertEqual(self.catalog.read_file("demo", saved['path'])['sha256'], args['sha256'])
+                with self.assertRaises(AccessError):
+                    self.prepare(name)
+
+    def test_large_versioned_document_mcp_delivery_and_safe_error_audit(self):
+        logs = io.StringIO()
+        audit = logging.Logger("test.candidate.audit")
+        audit.addHandler(logging.StreamHandler(logs))
+        body = "# 合成大文档\n\n" + "合成内容。" * 3100
+        self.assertGreater(len(body.encode()), 46000)
+
+        async def run():
+            async with Client(create_server(self.catalog, audit)) as client:
+                tools = {tool.name: tool for tool in (await client.list_tools()).tools}
+                self.assertFalse(tools['save_candidate'].annotations.read_only_hint)
+                prepared = await client.call_tool("prepare_candidate", {
+                    "project_id": "demo", "filename": "large-v2.1.md", "markdown": body})
+                self.assertFalse(prepared.is_error)
+                args = json.loads(prepared.content[0].text)['save_arguments']
+                self.assertLessEqual(len(args['document'].encode()), MAX_DOCUMENT_BYTES)
+                self.assertFalse(list(self.directory.iterdir()))
+                saved = await client.call_tool("save_candidate", args)
+                self.assertFalse(saved.is_error)
+                read = await client.call_tool("read_file", {"project_id": "demo", "path": args['path']})
+                self.assertEqual(json.loads(read.content[0].text)['sha256'], args['sha256'])
+                failed = await client.call_tool("prepare_candidate", {
+                    "project_id": "demo", "filename": "private note.md", "markdown": "PRIVATE_BODY"})
+                self.assertTrue(failed.is_error)
+                self.assertIn("candidate_filename_invalid", failed.content[0].text)
+                oversized = await client.call_tool("prepare_candidate", {
+                    "project_id": "demo", "filename": "large-v3.0.md", "markdown": "x" * MAX_DOCUMENT_BYTES})
+                self.assertTrue(oversized.is_error)
+                self.assertIn("candidate_document_too_large", oversized.content[0].text)
+                with patch.object(CandidateDelivery, 'prepare_candidate', side_effect=RuntimeError("SECRET_EXCEPTION")):
+                    unexpected = await client.call_tool("prepare_candidate", {
+                        "project_id": "demo", "filename": "exception.md", "markdown": "PRIVATE_BODY"})
+                    self.assertTrue(unexpected.is_error)
+                    self.assertNotIn("SECRET_EXCEPTION", unexpected.content[0].text)
+                return args
+
+        token = audit_request_id.set("f" * 32)
+        try:
+            args = asyncio.run(run())
+        finally:
+            audit_request_id.reset(token)
+        records = [json.loads(line) for line in logs.getvalue().splitlines()]
+        failures = [r['error_code'] for r in records if not r['ok']]
+        self.assertEqual(failures, ['candidate_filename_invalid', 'candidate_document_too_large', 'internal_error'])
+        self.assertTrue(all(r['request_id'] == "f" * 32 for r in records))
+        self.assertEqual(len({r['call_id'] for r in records}), len(records))
+        for value in (body, args['preparation'], 'PRIVATE_BODY', 'private note.md', 'SECRET_EXCEPTION'):
+            self.assertNotIn(value, logs.getvalue())
 
     def test_project_requires_explicit_write_configuration(self):
         service = CandidateDelivery(Catalog([Project("demo", "Demo", self.root)]))

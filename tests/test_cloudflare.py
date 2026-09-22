@@ -1,17 +1,21 @@
 import asyncio
 from dataclasses import replace
 import io
+import json
 import logging
 import time
 from types import SimpleNamespace
 import unittest
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
+from urllib.error import URLError
 
+import anyio
 from cryptography.hazmat.primitives.asymmetric import rsa
 import jwt
 from starlette.responses import JSONResponse
 
 from peters_mcp.cloudflare import AccessMiddleware, AccessSettings, AccessVerifier
+from peters_mcp.audit import audit_request_id
 
 
 class CloudflareTests(unittest.TestCase):
@@ -96,6 +100,141 @@ class CloudflareTests(unittest.TestCase):
         self.assertNotIn("forged", logs.getvalue())
         self.assertEqual(asyncio.run(run([(b"cf-access-jwt-assertion", valid)])), 200)
         self.assertEqual(called, [True])
+
+    async def request(self, middleware, token):
+        messages = []
+        async def receive():
+            return {"type": "http.request", "body": b"private-document-marker", "more_body": False}
+        async def send(message):
+            messages.append(message)
+        await middleware({"type": "http", "headers": [
+            (b"cf-access-jwt-assertion", token.encode()),
+            (b"x-request-id", b"untrusted-client-request-id"),
+        ]}, receive, send)
+        return messages
+
+    def test_key_network_errors_are_retryable_without_access_or_sensitive_logs(self):
+        for failure in (jwt.PyJWKClientConnectionError("private-network-error-marker"),
+                        OSError("private-network-error-marker")):
+            with self.subTest(failure=type(failure).__name__):
+                verifier = Mock()
+                verifier.verify.side_effect = failure
+                called = []
+                logs = io.StringIO()
+                audit = logging.Logger("test.cloudflare.unavailable")
+                audit.addHandler(logging.StreamHandler(logs))
+                async def app(scope, receive, send):
+                    called.append(True)
+                token = self.token()
+                messages = asyncio.run(self.request(AccessMiddleware(app, verifier, audit), token))
+                self.assertEqual(messages[0]["status"], 503)
+                headers = dict(messages[0]["headers"])
+                self.assertEqual(headers[b"retry-after"], b"5")
+                self.assertEqual(headers[b"cache-control"], b"no-store")
+                self.assertNotIn(b"www-authenticate", headers)
+                self.assertEqual(json.loads(messages[1]["body"])["code"], "authentication_unavailable")
+                self.assertEqual(called, [])
+                record = json.loads(logs.getvalue())
+                self.assertEqual(set(record), {"time", "event", "request_id", "ok", "error_code",
+                                               "status_code", "elapsed_ms"})
+                self.assertEqual(record["error_code"], "authentication_unavailable")
+                self.assertEqual(record["status_code"], 503)
+                self.assertFalse(record["ok"])
+                self.assertEqual(record["request_id"].encode(), headers[b"x-request-id"])
+                self.assertGreaterEqual(record["elapsed_ms"], 0)
+                exposed = logs.getvalue() + str(messages)
+                for private in (token, "owner@example.com", "private-document-marker",
+                                "private-network-error-marker", "untrusted-client-request-id"):
+                    self.assertNotIn(private, exposed)
+                self.assertIsNone(audit_request_id.get())
+
+    def test_actual_jwk_fetch_failure_is_503_but_unknown_key_is_401(self):
+        verifier = AccessVerifier(self.settings)
+        called = []
+        async def app(scope, receive, send):
+            called.append(True)
+        middleware = AccessMiddleware(app, verifier)
+        opener = Mock()
+        opener.open.side_effect = URLError("synthetic network failure")
+        with patch("jwt.jwks_client.urllib.request.build_opener", return_value=opener):
+            messages = asyncio.run(self.request(middleware, self.token()))
+        self.assertEqual(messages[0]["status"], 503)
+        jwk = json.loads(jwt.algorithms.RSAAlgorithm.to_jwk(self.key.public_key()))
+        jwk.update(kid="different-key", use="sig", alg="RS256")
+        with patch.object(verifier.keys, "fetch_data", return_value={"keys": [jwk]}):
+            messages = asyncio.run(self.request(middleware, self.token()))
+        self.assertEqual(messages[0]["status"], 401)
+        self.assertNotIn(b"retry-after", dict(messages[0]["headers"]))
+        self.assertEqual(called, [])
+
+    def test_expired_bad_signature_and_identity_remain_401(self):
+        async def app(scope, receive, send):
+            self.fail("Denied assertions must not execute the app")
+        middleware = AccessMiddleware(app, self.verifier)
+        for token in (self.token({"exp": int(time.time()) - 60}),
+                      self.token({"email": "stranger@example.com"}),
+                      self.token(key=self.other_key), "malformed"):
+            messages = asyncio.run(self.request(middleware, token))
+            self.assertEqual(messages[0]["status"], 401)
+            self.assertEqual(json.loads(messages[1]["body"])["code"], "authentication_required")
+            self.assertNotIn(b"retry-after", dict(messages[0]["headers"]))
+
+    def test_request_ids_are_isolated_propagated_to_workers_and_reset(self):
+        seen = []
+        logs = io.StringIO()
+        audit = logging.Logger("test.cloudflare.requests")
+        audit.addHandler(logging.StreamHandler(logs))
+        async def app(scope, receive, send):
+            request_id = audit_request_id.get()
+            await asyncio.sleep(0)
+            worker_id = await anyio.to_thread.run_sync(audit_request_id.get)
+            seen.append((request_id, worker_id))
+            await JSONResponse({"ok": True}, headers={"X-Request-ID": "do-not-reuse"})(scope, receive, send)
+        middleware = AccessMiddleware(app, self.verifier, audit)
+        token = self.token()
+        async def run():
+            parent = audit_request_id.set("parent-context")
+            try:
+                result = await asyncio.gather(self.request(middleware, token), self.request(middleware, token))
+                result.append(await self.request(middleware, token))
+                self.assertEqual(audit_request_id.get(), "parent-context")
+                return result
+            finally:
+                audit_request_id.reset(parent)
+        messages = asyncio.run(run())
+        ids = [dict(response[0]["headers"])[b"x-request-id"].decode() for response in messages]
+        self.assertEqual(len(set(ids)), 3)
+        self.assertEqual({item[0] for item in seen}, set(ids))
+        self.assertTrue(all(request_id == worker_id for request_id, worker_id in seen))
+        for record in map(json.loads, logs.getvalue().splitlines()):
+            self.assertTrue(record["ok"])
+            self.assertEqual(record["status_code"], 200)
+            self.assertIsNone(record["error_code"])
+        self.assertIsNone(audit_request_id.get())
+
+    def test_unexpected_verifier_error_is_not_logged_as_success(self):
+        verifier = Mock()
+        verifier.verify.side_effect = RuntimeError("private-exception-marker")
+        logs = io.StringIO()
+        audit = logging.Logger("test.cloudflare.internal")
+        audit.addHandler(logging.StreamHandler(logs))
+        async def app(scope, receive, send):
+            self.fail("Verification failure must not execute the app")
+        messages = asyncio.run(self.request(AccessMiddleware(app, verifier, audit), self.token()))
+        self.assertEqual(messages[0]["status"], 500)
+        headers = dict(messages[0]["headers"])
+        self.assertEqual(headers[b"cache-control"], b"no-store")
+        self.assertNotIn(b"www-authenticate", headers)
+        body = json.loads(messages[1]["body"])
+        self.assertEqual(body["code"], "authentication_internal_error")
+        self.assertNotIn("authentication required", body["error"])
+        record = json.loads(logs.getvalue())
+        self.assertFalse(record["ok"])
+        self.assertEqual(record["error_code"], "authentication_internal_error")
+        self.assertEqual(record["status_code"], 500)
+        self.assertEqual(record["request_id"].encode(), headers[b"x-request-id"])
+        self.assertNotIn("private-exception-marker", logs.getvalue() + str(messages))
+        self.assertIsNone(audit_request_id.get())
 
 
 if __name__ == "__main__":

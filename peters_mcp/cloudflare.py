@@ -59,10 +59,30 @@ class AccessSettings:
                    tuple(email.casefold() for email in data["allowed_emails"]))
 
 
+class KeySourceUnavailable(Exception):
+    """The trusted key source could not provide a usable signing-key set."""
+
+
+class AccessJWKClient(jwt.PyJWKClient):
+    def get_signing_keys(self, refresh=False):
+        # This operation only fetches/parses the configured key source. Token
+        # parsing and unknown-kid lookup happen outside this exception boundary.
+        try:
+            return super().get_signing_keys(refresh)
+        except (jwt.PyJWKClientConnectionError, OSError):
+            raise KeySourceUnavailable() from None
+        except (jwt.PyJWTError, ValueError, TypeError, AttributeError):
+            # PyJWT caches decoded JSON before validating its structure/keys.
+            # Discard that invalid source so a retry can fetch corrected data.
+            if self.jwk_set_cache is not None:
+                self.jwk_set_cache.put(None)
+            raise KeySourceUnavailable() from None
+
+
 class AccessVerifier:
     def __init__(self, settings):
         self.settings = settings
-        self.keys = jwt.PyJWKClient(
+        self.keys = AccessJWKClient(
             settings.team_domain + "/cdn-cgi/access/certs",
             cache_keys=False, cache_jwk_set=True, lifespan=300, timeout=5,
         )
@@ -123,8 +143,8 @@ class AccessMiddleware:
                 raise jwt.InvalidTokenError("Missing or duplicate assertion.")
             token = tokens[0].decode("ascii")
             await anyio.to_thread.run_sync(self.verifier.verify, token)
-        except (jwt.PyJWKClientConnectionError, OSError):
-            # A key-fetch outage must fail closed without asking the user to log in.
+        except (KeySourceUnavailable, jwt.PyJWKClientConnectionError, OSError):
+            # A key-source failure must fail closed without asking the user to log in.
             # Ordinary PyJWKClientError also covers an unknown kid: keep that 401.
             status, error_code = 503, "authentication_unavailable"
         except (jwt.PyJWTError, UnicodeDecodeError, ValueError):

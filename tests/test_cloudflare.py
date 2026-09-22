@@ -179,6 +179,81 @@ class CloudflareTests(unittest.TestCase):
             self.assertEqual(json.loads(messages[1]["body"])["code"], "authentication_required")
             self.assertNotIn(b"retry-after", dict(messages[0]["headers"]))
 
+    def public_jwk(self, **changes):
+        jwk = json.loads(jwt.algorithms.RSAAlgorithm.to_jwk(self.key.public_key()))
+        return {**jwk, "kid": "test-key", "use": "sig", "alg": "RS256", **changes}
+
+    def test_malformed_or_unusable_key_sources_are_retryable_and_private(self):
+        sources = [
+            b"private-source-marker: not JSON", b"\xff", b"[]", b"null",
+            {}, {"keys": "private-source-marker"}, {"keys": []}, {"keys": [None]},
+            {"keys": [{"kty": "unsupported", "private": "private-source-marker"}]},
+            {"keys": [self.public_jwk(n="")]},
+            {"keys": [self.public_jwk(use="enc")]},
+            {"keys": [self.public_jwk(kid=None)]},
+        ]
+        for source in sources:
+            with self.subTest(source=source):
+                verifier = AccessVerifier(self.settings)
+                logs = io.StringIO()
+                audit = logging.Logger("test.cloudflare.key-source")
+                audit.addHandler(logging.StreamHandler(logs))
+                async def app(scope, receive, send):
+                    self.fail("Unusable key source must not execute the app")
+                raw = source if isinstance(source, bytes) else json.dumps(source).encode()
+                opener = Mock()
+                opener.open.return_value = io.BytesIO(raw)
+                with patch("jwt.jwks_client.urllib.request.build_opener", return_value=opener):
+                    messages = asyncio.run(self.request(AccessMiddleware(app, verifier, audit), self.token()))
+                self.assertEqual(messages[0]["status"], 503)
+                headers = dict(messages[0]["headers"])
+                self.assertEqual(headers[b"retry-after"], b"5")
+                self.assertEqual(headers[b"cache-control"], b"no-store")
+                self.assertNotIn(b"www-authenticate", headers)
+                self.assertEqual(json.loads(messages[1]["body"])["code"], "authentication_unavailable")
+                record = json.loads(logs.getvalue())
+                self.assertEqual(record["error_code"], "authentication_unavailable")
+                self.assertEqual(record["request_id"].encode(), headers[b"x-request-id"])
+                self.assertNotIn("private-source-marker", logs.getvalue() + str(messages))
+
+    def test_invalid_key_cache_recovers_without_serving_expired_keys(self):
+        verifier = AccessVerifier(self.settings)
+        called = []
+        async def app(scope, receive, send):
+            called.append(True)
+            await JSONResponse({"ok": True})(scope, receive, send)
+        middleware = AccessMiddleware(app, verifier)
+        valid = json.dumps({"keys": [self.public_jwk()]}).encode()
+        opener = Mock()
+        opener.open.side_effect = [io.BytesIO(b'{"keys": []}'), io.BytesIO(valid),
+                                   URLError("synthetic outage")]
+        with patch("jwt.jwks_client.urllib.request.build_opener", return_value=opener):
+            self.assertEqual(asyncio.run(self.request(middleware, self.token()))[0]["status"], 503)
+            self.assertEqual(asyncio.run(self.request(middleware, self.token()))[0]["status"], 200)
+            self.assertEqual(asyncio.run(self.request(middleware, self.token()))[0]["status"], 200)
+            self.assertEqual(opener.open.call_count, 2)
+            self.assertEqual(verifier.keys.jwk_set_cache.lifespan, 300)
+            with patch.object(verifier.keys.jwk_set_cache, "is_expired", return_value=True):
+                self.assertEqual(asyncio.run(self.request(middleware, self.token()))[0]["status"], 503)
+        self.assertEqual(len(called), 2)
+
+    def test_real_key_source_preserves_token_rejections(self):
+        verifier = AccessVerifier(self.settings)
+        async def app(scope, receive, send):
+            self.fail("Invalid token must not execute the app")
+        middleware = AccessMiddleware(app, verifier)
+        opener = Mock()
+        opener.open.return_value = io.BytesIO(json.dumps({"keys": [self.public_jwk()]}).encode())
+        tokens = [self.token(key=self.other_key), self.token({"exp": int(time.time()) - 60}),
+                  self.token({"email": "stranger@example.com"}), "malformed",
+                  jwt.encode(self.claims, self.key, algorithm="RS256", headers={"kid": "unknown-key"})]
+        with patch("jwt.jwks_client.urllib.request.build_opener", return_value=opener):
+            for token in tokens:
+                messages = asyncio.run(self.request(middleware, token))
+                self.assertEqual(messages[0]["status"], 401)
+                self.assertEqual(json.loads(messages[1]["body"])["code"], "authentication_required")
+                self.assertNotIn(b"retry-after", dict(messages[0]["headers"]))
+
     def test_request_ids_are_isolated_propagated_to_workers_and_reset(self):
         seen = []
         logs = io.StringIO()

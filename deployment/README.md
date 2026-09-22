@@ -118,7 +118,7 @@ Linux 可前台运行相同 origin 与 tunnel；仓库的 LaunchAgent 管理脚�
 
 ## 网络中断与授权到期的区分
 
-本机 origin 将缺失、失效、伪造签名或不符合身份白名单的凭证返回为 `401 / authentication_required`。公钥获取的连接故障返回 `503 / authentication_unavailable` 和 `Retry-After: 5`，仍拒绝执行工具；这种故障应等待网络恢复，不应据此撤销用户授权。未识别的公钥内容错误仍可能沿用认证错误分类，不能声称所有上游错误都已自动识别。
+本机 origin 将缺失、失效、伪造签名或不符合身份白名单的凭证返回为 `401 / authentication_required`。公钥来源的连接故障、无法解析的 JSON、无效结构或没有可用签名 key 返回 `503 / authentication_unavailable` 和 `Retry-After: 5`，仍拒绝执行工具；这种故障不应被当成用户必须重新登录。有效 keyset 中找不到请求的 `kid` 仍为 401。畸形来源数据不会留在缓存中阻止恢复；有效公钥缓存仍使用原 300 秒期限，不会为绕过故障无限续期或使用过期缓存。
 
 认证阶段记录 `event=access_check`、时间、`request_id`、状态和错误码；每次工具调用有自己的 `call_id`，HTTP 调用会带关联的 `request_id`。响应头返回 `X-Request-ID`。日志不包含 JWT、邮箱、正文、搜索词或异常详情。认证阶段 `status_code=200` 只表示凭证校验成功，仍须核对工具审计。
 

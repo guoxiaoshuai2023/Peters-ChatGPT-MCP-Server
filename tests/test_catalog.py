@@ -28,6 +28,17 @@ class CatalogTests(unittest.TestCase):
         result = self.catalog.list_projects()
         self.assertNotIn(str(self.root), json.dumps(result))
 
+    def test_published_checksum_manifest_can_be_read_and_searched(self):
+        from hashlib import sha256
+        raw = ('0' * 64 + '  report.md\n').encode()
+        self.write('MANIFEST.sha256', raw.decode())
+        result = self.catalog.read_file('demo', 'MANIFEST.sha256')
+        self.assertEqual(result['text'], raw.decode())
+        self.assertEqual(result['sha256'], sha256(raw).hexdigest())
+        self.assertTrue(next(x for x in self.catalog.list_files('demo')['entries']
+                             if x['path'] == 'MANIFEST.sha256')['format_supported'])
+        self.assertEqual(self.catalog.search('demo', 'report.md')['matches'][0]['path'], 'MANIFEST.sha256')
+
     def test_unicode_pagination_and_version_binding(self):
         first = self.catalog.read_file("demo", "README.md", limit=5)
         second = self.catalog.read_file("demo", "README.md", offset=first["next_offset"],

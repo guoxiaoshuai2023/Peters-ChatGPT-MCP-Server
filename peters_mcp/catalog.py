@@ -48,7 +48,7 @@ TEXT_SUFFIXES = frozenset({
     ".java", ".kt", ".swift", ".c", ".h", ".cpp", ".hpp", ".xml", ".ini",
     ".cfg", ".r", ".vue", ".svelte", ".ipynb", ".mermaid",
 })
-TEXT_NAMES = {"readme", "license", "dockerfile", "makefile", "justfile", ".gitignore", ".gitattributes", ".dockerignore", ".editorconfig"}
+TEXT_NAMES = {"readme", "license", "dockerfile", "makefile", "justfile", ".gitignore", ".gitattributes", ".dockerignore", ".editorconfig", "manifest.sha256"}
 MAX_FILE_BYTES = 8 * 1024 * 1024
 MAX_DIRECTORY_ENTRIES = 10000
 MAX_SEARCH_FILES = 3000

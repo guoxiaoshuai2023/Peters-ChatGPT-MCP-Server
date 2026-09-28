@@ -16,10 +16,9 @@ import threading
 import time
 
 from .catalog import AccessError, DIRECTORY_FLAGS, integer
-from .history_projection import accept_session_metadata, project_rollout, project_tool, sanitize
+from .history_projection import project_tool, sanitize
 
 ID_PATTERN = re.compile(r"[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}")
-MAX_SOURCE_BYTES = 64 * 1024 * 1024
 CURSOR_TTL = 30 * 60
 BACKEND = "codex_local_jsonl_readonly_fallback"
 COMMON_LIMITS = (
@@ -38,7 +37,16 @@ def utc(value):
         return None
 
 
+from .history_scan import scan, stamp, PROJECTION_VERSION, RECORD_BYTES
+
+MAX_CANDIDATES = 2048
+MAX_METADATA_BYTES = 8 * 1024 * 1024
+MAX_SNAPSHOTS = 8
+MAX_CACHE_BYTES = 128 * 1024 * 1024
+
 class HistoryAccess:
+    """In-process engine. MCP entrypoints run its generators in IsolatedHistory."""
+
     def __init__(self, config_path=None, project_ids=(), catalog=None):
         self.config_path = Path(config_path) if config_path else None
         self.project_ids = set(project_ids)
@@ -47,6 +55,9 @@ class HistoryAccess:
         self._key = secrets.token_bytes(32)
         self._find_cache = {}
         self._lock = threading.Lock()
+        self._verified = {}
+        self._snapshots = {}
+        self._deliveries = {}
 
     def _configuration(self):
         if self.catalog is not None:
@@ -113,14 +124,17 @@ class HistoryAccess:
         except (OSError, ValueError, TypeError, KeyError):
             raise AccessError("History access configuration is unavailable or invalid; access is closed.") from None
 
+
     def _authorized(self, config, thread_id):
         if not isinstance(thread_id, str) or thread_id not in config["threads"]:
             raise AccessError("Thread is not authorized: no explicit grant or verified authorized repository association.")
         return config["threads"][thread_id]
 
+
     def _sign(self, data):
         body = base64.urlsafe_b64encode(json.dumps(data, separators=(",", ":"), sort_keys=True).encode()).decode()
         return body + "." + hmac.new(self._key, body.encode(), hashlib.sha256).hexdigest()
+
 
     def _verify(self, token, config, kind, thread_id=None):
         try:
@@ -132,12 +146,12 @@ class HistoryAccess:
             value = json.loads(base64.b64decode(body, altchars=b"-_", validate=True))
             if value["kind"] != kind or value["scope"] != config["scope"] or value["expires"] < time.time():
                 raise ValueError()
-            if thread_id is not None and (value.get("thread") != thread_id or
-                    value.get("association") != config["threads"][thread_id].get("_proof")):
+            if thread_id is not None and value.get("thread") != thread_id:
                 raise ValueError()
             return value
         except (ValueError, TypeError, KeyError, UnicodeError):
             raise AccessError("Invalid, expired, cross-thread or revoked history cursor/item ID; start a fresh read.") from None
+
 
     def _token(self, config, kind, **values):
         if "thread" in values:
@@ -145,101 +159,6 @@ class HistoryAccess:
         return self._sign({"kind": kind, "scope": config["scope"],
                            "expires": int(time.time()) + CURSOR_TTL, **values})
 
-    def _metadata(self, config, thread_id=None):
-        """Pure SELECT metadata only. Candidate rows are filtered before any export."""
-        if not config["threads"] and not (config["inherit"] and config["snapshots"]):
-            return {}
-        path = config["database"]
-        try:
-            if path.is_symlink() or not stat.S_ISREG(path.stat().st_mode):
-                raise ValueError()
-            connection = sqlite3.connect(path.as_uri() + "?mode=ro", uri=True, timeout=2)
-            try:
-                connection.execute("PRAGMA query_only=ON")
-                columns = {row[1] for row in connection.execute("PRAGMA table_info(threads)")}
-                required = {"id", "rollout_path", "cwd", "title", "updated_at", "archived"}
-                if not required <= columns:
-                    raise ValueError()
-                selected = ["id", "rollout_path", "cwd", "title", "updated_at", "archived"]
-                selected += [key for key in ("name", "history_mode", "created_at") if key in columns]
-                ids = [thread_id] if thread_id else sorted(config["threads"])
-                sql = "SELECT " + ",".join(selected) + " FROM threads"
-                if thread_id or not (config["inherit"] and config["snapshots"]):
-                    sql += " WHERE id IN (" + ",".join("?" for _ in ids) + ")"
-                else:
-                    ids = []
-                return {row[0]: dict(zip(selected, row)) for row in connection.execute(sql, ids)}
-            finally:
-                connection.close()
-        except (sqlite3.Error, OSError, ValueError, TypeError):
-            raise AccessError("Supported Codex metadata index is missing, incompatible or busy; history is not proven empty.") from None
-
-    def _recorded_contexts(self, config, row, raw=None):
-        """Extract only identity/cwd metadata; never retain unauthorized message bodies."""
-        key = None
-        if raw is None:
-            with self._open_rollout(config, row) as fd:
-                before = os.fstat(fd)
-                if before.st_size > MAX_SOURCE_BYTES:
-                    raise AccessError("Association source exceeds the history size limit.")
-                key = (row["id"], before.st_dev, before.st_ino, before.st_size,
-                       before.st_mtime_ns, before.st_ctime_ns)
-                with self._lock:
-                    cached = self._association_cache.get(key)
-                if cached is not None:
-                    return cached
-                raw = self._prefix(fd, before.st_size)
-                after = os.fstat(fd)
-                if (before.st_size, before.st_mtime_ns, before.st_ctime_ns) != (after.st_size, after.st_mtime_ns, after.st_ctime_ns):
-                    raise AccessError("Association source changed; repeat the request.")
-        contexts, session_seen, reason = set(), False, None
-        seen_meta, permitted_meta = set(), set()
-        for line in raw.splitlines(keepends=True):
-            if not line.endswith(b"\n"):
-                # An incomplete append cannot introduce an exported record yet.
-                continue
-            try:
-                record = json.loads(line)
-            except (ValueError, UnicodeError):
-                reason = "malformed_record_cannot_prove_association"
-                break
-            if not isinstance(record, dict):
-                reason = "unknown_record_shape_cannot_prove_association"
-                break
-            kind = record.get("type")
-            if not isinstance(kind, str) or kind not in {
-                "session_meta", "turn_context", "response_item", "event_msg", "world_state",
-                "token_usage_record", "inter_agent_communication_metadata", "compacted"
-            }:
-                reason = "unknown_record_type_cannot_prove_association"
-                break
-            if kind not in {"session_meta", "turn_context"}:
-                continue
-            payload = record.get("payload")
-            if not isinstance(payload, dict):
-                reason = "missing_context_metadata"
-                break
-            if record["type"] == "session_meta":
-                try:
-                    own = accept_session_metadata(payload, row["id"], seen_meta, permitted_meta)
-                except AccessError:
-                    reason = "session_identity_mismatch"
-                    break
-                session_seen = session_seen or own
-            cwd = payload.get("cwd")
-            if not isinstance(cwd, str) or not cwd or not Path(cwd).is_absolute():
-                reason = "missing_recorded_working_directory"
-                break
-            contexts.add(cwd)
-        if not session_seen:
-            reason = reason or "missing_session_identity"
-        result = {"contexts": sorted(contexts), "reason": reason, "session_ids": sorted(seen_meta)}
-        if key is not None:
-            with self._lock:
-                if len(self._association_cache) > 1024:
-                    self._association_cache.clear()
-                self._association_cache[key] = result
-        return result
 
     def _associate(self, config, cwd):
         # Request-local reuse only: each new request and final revalidation probes
@@ -249,6 +168,7 @@ class HistoryAccess:
         if key not in cache:
             cache[key] = self.catalog.repositories.associate(cwd, config["snapshots"])
         return cache[key]
+
 
     def _derive(self, config, row, raw=None):
         tid = row["id"]
@@ -283,11 +203,13 @@ class HistoryAccess:
         proof = {"index_cwd": row["cwd"], "contexts": proofs, "project_id": pid}
         return {"id": tid, "project_id": pid, "allow_tool_results": False, "mcp_tools": [],
                 "_proof": hashlib.sha256(json.dumps(proof, sort_keys=True).encode()).hexdigest(),
+                "_proof_context": proof,
                 "_association": {"source": "repository_inheritance", "state": "matched",
                     "project_id": pid, "worktree_id": association["worktree_id"],
                     "repository_id": association["repository_id"],
                     "reason": "index_and_all_recorded_contexts_match_authorized_repository",
                     "recorded_context_count": len(proofs)}}, None
+
 
     def _attributable_pending(self, config, row):
         """Only aggregate unresolved records lexically attributable to a known root.
@@ -307,32 +229,6 @@ class HistoryAccess:
                    if self.catalog.projects[pid].repository_id is not None
                    for entry in snap["worktrees"])
 
-    def _request(self, thread_id=None):
-        config = self._configuration()
-        if thread_id is not None and (not isinstance(thread_id, str) or not ID_PATTERN.fullmatch(thread_id)):
-            raise AccessError("Thread is not authorized.")
-        rows = self._metadata(config, thread_id)
-        pending = {}
-        for tid, row in rows.items():
-            grant, reason = self._derive(config, row)
-            if grant:
-                config["threads"][tid] = grant
-            elif reason != "explicitly_denied" and self._attributable_pending(config, row):
-                pending[reason] = pending.get(reason, 0) + 1
-        config["pending"] = [{"reason": reason, "count": count} for reason, count in sorted(pending.items())]
-        return config, rows
-
-    def _revalidate(self, config, rows):
-        """Check hot revocation and current association before returning collected data."""
-        fresh = self._configuration()
-        if fresh["scope"] != config["scope"]:
-            raise AccessError("History authorization or repository topology changed; start a fresh read.")
-        for tid, row in rows.items():
-            current = self._metadata(fresh, tid).get(tid)
-            grant, _ = self._derive(fresh, current) if current else (None, None)
-            old = config["threads"].get(tid)
-            if not grant or not old or grant.get("_proof") != old.get("_proof"):
-                raise AccessError("Thread association changed or was revoked; start a fresh read.")
 
     @contextmanager
     def _open_rollout(self, config, metadata):
@@ -368,44 +264,6 @@ class HistoryAccess:
             if fd is not None:
                 os.close(fd)
 
-    @staticmethod
-    def _prefix(fd, size):
-        chunks, offset = [], 0
-        while offset < size:
-            chunk = os.pread(fd, min(size - offset, 262144), offset)
-            if not chunk:
-                raise AccessError("History was truncated during reading; restart the read.")
-            chunks.append(chunk)
-            offset += len(chunk)
-        return b"".join(chunks)
-
-    def _snapshot(self, config, metadata, expected=None):
-        with self._open_rollout(config, metadata) as fd:
-            before = os.fstat(fd)
-            size = expected["bytes"] if expected else before.st_size
-            if size > MAX_SOURCE_BYTES:
-                raise AccessError("History exceeds the 64 MiB source limit; not returned as an empty or complete thread.")
-            if expected and (before.st_dev != expected["device"] or before.st_ino != expected["inode"]):
-                raise AccessError("History identity changed between pages; restart the read.")
-            raw = self._prefix(fd, size)
-            after = os.fstat(fd)
-            if (before.st_size, before.st_mtime_ns, before.st_ctime_ns) != (after.st_size, after.st_mtime_ns, after.st_ctime_ns):
-                if self._prefix(fd, size) != raw:
-                    raise AccessError("History changed during reading; restart the read.")
-            digest = hashlib.sha256(raw).hexdigest()
-            if expected and digest != expected["sha256"]:
-                raise AccessError("Earlier history changed between pages; restart the read.")
-            snapshot = expected or {"bytes": size, "sha256": digest, "device": before.st_dev,
-                                    "inode": before.st_ino, "captured_at": utc(time.time())}
-            previous = config["threads"][metadata["id"]]
-            if previous["_association"]["source"] == "repository_inheritance":
-                grant, _ = self._derive(config, metadata, raw)
-                if not grant or grant.get("_proof") != previous.get("_proof"):
-                    raise AccessError("Read source does not match the verified repository association.")
-            projection = project_rollout(raw, metadata["id"])
-            if config["denied"].intersection(projection["stored_session_ids"]):
-                raise AccessError("Stored fork snapshot includes an explicitly revoked conversation; access denied.")
-            return projection, snapshot, after.st_size > size
 
     def _summary(self, config, row):
         grant = config["threads"][row["id"]]
@@ -423,175 +281,445 @@ class HistoryAccess:
                 "metadata_redactions": redactions + cwd_redactions + label_redactions,
                 "tool_results_authorized": grant.get("allow_tool_results", False)}
 
-    def find_codex_threads(self, query="", project_id="", cursor="", limit=10):
-        config, rows = self._request()
-        integer(limit, "limit", 1, 20)
-        if not isinstance(query, str) or len(query) > 200 or not isinstance(project_id, str):
-            raise AccessError("Use a query of at most 200 characters and a configured project ID.")
-        if project_id and project_id not in self.project_ids:
-            raise AccessError("Unknown project filter.")
-        parameters = {"query": query, "project_id": project_id, "limit": limit}
-        if cursor:
-            token = self._verify(cursor, config, "find")
-            if token["parameters"] != parameters:
-                raise AccessError("Search cursor belongs to different query/filter/limit parameters.")
-            with self._lock:
-                cached = self._find_cache.get(token["snapshot_id"])
-            if cached is None:
-                raise AccessError("Search snapshot expired or server restarted. Repeat the search.")
-            for tid, proof in cached["proofs"].items():
-                grant = config["threads"].get(tid)
-                if not grant or grant.get("_proof") != proof:
-                    raise AccessError("Search snapshot association changed or revoked; start a fresh search.")
-            start, snapshot_id = token["position"], token["snapshot_id"]
+
+    def close(self):
+        self._snapshots.clear()
+        self._verified.clear()
+        self._deliveries.clear()
+        self._find_cache.clear()
+
+    @staticmethod
+    def _drain(iterator):
+        while True:
+            try:
+                next(iterator)
+            except StopIteration as done:
+                return done.value
+
+    def operation_iter(self, operation, arguments):
+        if operation not in {'find_codex_threads', 'read_codex_thread', 'read_codex_thread_item'}:
+            raise AccessError('Unknown history operation.')
+        return (yield from getattr(self, '_' + operation + '_iter')(**arguments))
+
+    def revalidate_result_iter(self, operation, arguments, result):
+        recipe = self._deliveries.get(id(result))
+        if recipe is None:
+            raise AccessError('Prepared response expired; restart the read.', code='restart_required')
+        config, rows, snapshots = recipe
+        fresh = yield from self._revalidate_iter(config, rows, snapshots)
+        if result.get('snapshot'):
+            row = rows[result['thread']['thread_id']] if 'thread' in result else rows[result['thread_id']]
+            current = self._verified[row['id']]
+            result['appended_since_snapshot'] = current['stamp'][2] > result['snapshot']['bytes']
+        result['validated_at'] = utc(time.time())
+        return result
+
+    def _remember(self, result, config, rows, snapshots=None):
+        if len(self._deliveries) >= 16:
+            self._deliveries.pop(next(iter(self._deliveries)))
+        self._deliveries[id(result)] = (config, rows, snapshots or {})
+        result['status'] = 'ready'
+        result['projection_version'] = PROJECTION_VERSION
+        result['validated_at'] = utc(time.time())
+        return result
+
+    def _metadata(self, config, thread_id=None, project_id='', query=''):
+        if not config['threads'] and not (config['inherit'] and config['snapshots']):
+            return {}
+        path = config['database']
+        try:
+            if path.is_symlink() or not stat.S_ISREG(path.stat().st_mode):
+                raise ValueError()
+            connection = sqlite3.connect(path.as_uri() + '?mode=ro', uri=True, timeout=0.5)
+            try:
+                connection.execute('PRAGMA query_only=ON')
+                deadline = time.monotonic() + 1.5
+                connection.set_progress_handler(lambda: int(time.monotonic() >= deadline), 1000)
+                columns = {row[1] for row in connection.execute('PRAGMA table_info(threads)')}
+                selected = ['id', 'rollout_path', 'cwd', 'title', 'updated_at', 'archived']
+                if not set(selected) <= columns:
+                    raise ValueError()
+                selected += [k for k in ('name', 'history_mode', 'created_at') if k in columns]
+                where, params = [], []
+                if thread_id:
+                    where.append('id=?'); params.append(thread_id)
+                elif not (config['inherit'] and config['snapshots']):
+                    ids = list(config['threads'])
+                    where.append('id IN (' + ','.join('?' for _ in ids) + ')'); params.extend(ids)
+                elif project_id:
+                    roots = [w['root'] for w in config['snapshots'].get(project_id, {}).get('worktrees', [])]
+                    terms = []
+                    for root in roots:
+                        prefix = str(root).rstrip('/') + '/'
+                        terms.append('(cwd=? OR substr(cwd,1,?)=?)'); params.extend((str(root),len(prefix),prefix))
+                    ids = [tid for tid,g in config['threads'].items() if g.get('project_id')==project_id]
+                    if ids:
+                        terms.append('id IN ('+','.join('?' for _ in ids)+')');params.extend(ids)
+                    where.append('('+' OR '.join(terms)+')' if terms else '0')
+                sql = 'SELECT '+','.join(selected)+' FROM threads'+(' WHERE '+' AND '.join(where) if where else '')
+                # A bounded, short-lived SQL snapshot, never a transaction held over HTTP pages.
+                def collect(statement, bindings):
+                    rows, size = {}, 0
+                    cursor = connection.execute(statement+' ORDER BY id LIMIT ?', (*bindings, MAX_CANDIDATES+1))
+                    try:
+                        for values in cursor:
+                            size += sum(len(v.encode('utf-8')) if isinstance(v,str) else 16 for v in values)
+                            if len(rows) >= MAX_CANDIDATES or size > MAX_METADATA_BYTES:
+                                return None
+                            rows[values[0]] = dict(zip(selected, values))
+                    finally:
+                        cursor.close()
+                    return rows
+                rows = collect(sql, params)
+                if rows is None and query and not thread_id:
+                    connection.create_function('CASEFOLD', 1, lambda x: str(x or '').casefold())
+                    fields = ['title','cwd','id'] + (['name'] if 'name' in columns else [])
+                    predicate = '('+' OR '.join('instr(CASEFOLD('+k+'),?)>0' for k in fields)+')'
+                    bindings = list(params)+[query.casefold()]*len(fields)
+                    rows = collect(sql+(' AND ' if where else ' WHERE ')+predicate, bindings)
+                    config['metadata_only_candidates'] = True
+                if rows is None:
+                    raise AccessError('Candidate set exceeds the search budget; narrow the project/query.', code='narrow_query_required')
+                return rows
+            finally:
+                connection.close()
+        except AccessError:
+            raise
+        except sqlite3.OperationalError as exc:
+            if 'interrupted' in str(exc).lower():
+                raise AccessError('Metadata query exceeded its time budget; narrow the search.',code='resource_exhausted') from None
+            raise AccessError('Supported Codex metadata index is unavailable or busy.',code='metadata_unavailable') from None
+        except (sqlite3.Error, OSError, ValueError, TypeError):
+            raise AccessError('Supported Codex metadata index is missing, incompatible or busy; history is not proven empty.', code='metadata_unavailable') from None
+
+    def _eligible(self, config, row):
+        if row['id'] in config['denied']:
+            return False
+        if row['id'] in config['threads']:
+            return True
+        if not config['inherit'] or not self.catalog:
+            return False
+        association = self._associate(config, row.get('cwd'))
+        return association['state']=='matched' and self.catalog.projects[association['project_id']].repository_id is not None
+
+    @staticmethod
+    def _compatible_grant(old, current):
+        if old.get('_proof') == current.get('_proof'):
+            return True
+        a, b = old.get('_proof_context'), current.get('_proof_context')
+        if not a or not b or (a['index_cwd'],a['project_id']) != (b['index_cwd'],b['project_id']):
+            return False
+        key = lambda item: (item['cwd'],item['worktree_id'],item['repository_id'])
+        return {key(v) for v in a['contexts']} <= {key(v) for v in b['contexts']}
+
+    def _recorded_contexts(self, config, row, raw=None):
+        # Compatibility helper for local diagnostics. Public generators prepare
+        # this proof before _derive; they never synchronously scan here.
+        current = self._verified.get(row['id'])
+        if current is None:
+            current = self._drain(self._ensure_iter(config, row))
+        return current['proof']
+
+    def _ensure_iter(self, config, row, *, expected=None, projection=False):
+        if not self._eligible(config, row):
+            raise AccessError('Thread is not authorized.', code='unauthorized')
+        now = time.monotonic()
+        self._snapshots = {k:v for k,v in self._snapshots.items() if now-v['created'] < CURSOR_TTL}
+        self._verified = {k:v for k,v in self._verified.items() if now-v['created'] < CURSOR_TTL}
+        saved = None
+        if expected:
+            if expected.get('projection_version') != PROJECTION_VERSION:
+                raise AccessError('Projection version changed; restart the read.', code='snapshot_expired')
+            saved = self._snapshots.get(expected.get('id'))
+            if saved is None or saved['row_id'] != row['id'] or saved['snapshot'] != expected:
+                raise AccessError('History snapshot expired; restart the read.', code='snapshot_expired')
+        with self._open_rollout(config, row) as fd:
+            observed = stamp(os.fstat(fd))
+            previous = self._verified.get(row['id'])
+            if (previous and previous['stamp'] == observed and previous['path'] == row['rollout_path']
+                    and (not expected or expected['id'] in previous['prefixes'])
+                    and (not projection or (previous.get('snapshot_id') in self._snapshots
+                         and (previous.get('tool_refs') or not config['threads'].get(row['id'],{}).get('allow_tool_results',False))))):
+                grant, reason = self._derive(config, row)
+                if not grant or config['denied'].intersection(previous['proof']['session_ids']):
+                    raise AccessError('Thread association changed or was revoked.', code='unverifiable_source')
+                if saved and not self._compatible_grant(saved['grant'],grant):
+                    raise AccessError('Snapshot association changed.',code='authorization_changed')
+                config['threads'][row['id']] = grant
+                return previous
+            # Cache admission before allocating a new public projection.
+            if projection and len(self._snapshots) >= MAX_SNAPSHOTS:
+                raise AccessError('Active snapshot budget exhausted; retry after expiry or restart.', code='resource_exhausted')
+            current = yield from scan(fd, row['id'], projection=projection, expected=expected,
+                                      tool_refs=config['threads'].get(row['id'],{}).get('allow_tool_results',False))
+        with self._open_rollout(config, row) as fd:
+            if stamp(os.fstat(fd)) != current['stamp']:
+                raise AccessError('Source changed during verification; wait for stability.', code='waiting_source_stable')
+        current.update(path=row['rollout_path'], created=now, prefixes={expected['id']} if expected else set())
+        # Do not keep raw/tool payloads or unlimited per-source versions in memory.
+        self._verified[row['id']] = current
+        if len(self._verified)>MAX_CANDIDATES:
+            self._verified.pop(next(iter(self._verified)))
+        grant, reason = self._derive(config, row)
+        if not grant:
+            self._verified.pop(row['id'], None)
+            error = AccessError('Thread is not authorized: source association could not be verified.', code='unverifiable_source')
+            error.association_reason = reason
+            raise error
+        if config['denied'].intersection(current['proof']['session_ids']):
+            self._verified.pop(row['id'], None)
+            raise AccessError('Stored fork snapshot includes an explicitly revoked conversation.', code='unauthorized')
+        config['threads'][row['id']] = grant
+        if saved and not self._compatible_grant(saved['grant'],grant):
+            raise AccessError('Snapshot association changed.',code='authorization_changed')
+        if projection:
+            projected = current.pop('projection')
+            size = sum(4*len(m['text'])+1024 for m in projected['messages']) + len(projected['tools'])*1024
+            if len(self._snapshots) >= MAX_SNAPSHOTS or size + sum(v['weight'] for v in self._snapshots.values()) > MAX_CACHE_BYTES:
+                raise AccessError('Public snapshots exceed the memory budget.', code='resource_exhausted')
+            snapshot = {'id':secrets.token_hex(12), 'bytes':current['bytes'], 'sha256':current['sha256'],
+                        'device':current['device'], 'inode':current['inode'], 'captured_at':utc(time.time()),
+                        'projection_version':PROJECTION_VERSION}
+            self._snapshots[snapshot['id']]={'row_id':row['id'],'projection':projected,'snapshot':snapshot,'grant':grant,
+                                             'weight':size,'created':now}
+            current['snapshot_id']=snapshot['id'];current['prefixes'].add(snapshot['id'])
+            current['tool_refs']=grant.get('allow_tool_results',False)
         else:
-            results, warnings = [], list(config["pending"])
-            deadline, scanned_bytes = time.monotonic() + 15, 0
-            for thread_id, grant in config["threads"].items():
-                if project_id and grant.get("project_id") != project_id:
-                    continue
-                row = rows.get(thread_id)
-                if row is None:
-                    warnings.append({"thread_id": thread_id, "reason": "metadata_missing_history_not_proven_empty"})
-                    continue
-                summary = self._summary(config, row)
-                needle = query.casefold()
-                if not needle or any(needle in str(summary.get(k) or "").casefold() for k in ("title", "label", "cwd", "project_id")):
-                    summary["match"] = {"in": "metadata", "query": query}
-                    results.append(summary)
-                    continue
-                if time.monotonic() >= deadline or scanned_bytes > 128 * 1024 * 1024:
-                    warnings.append({"thread_id": thread_id, "reason": "content_search_budget_exhausted"})
-                    continue
-                try:
-                    projection, snap, _ = self._snapshot(config, row)
-                    scanned_bytes += snap["bytes"]
-                    if projection["warnings"]:
-                        warnings.append({"thread_id": thread_id, "reason": "partial_public_projection"})
-                    match = next((m for m in projection["messages"] if needle in m["text"].casefold()), None)
-                    if match:
-                        index = match["text"].casefold().find(needle)
-                        summary["match"] = {"in": "public_message", "message_id": match["message_id"],
-                                            "snippet": match["text"][max(0, index - 60):index + 180],
-                                            "snapshot_sha256": snap["sha256"]}
-                        results.append(summary)
-                except AccessError:
-                    warnings.append({"thread_id": thread_id, "reason": "content_unavailable_not_proven_empty"})
-            results.sort(key=lambda r: (r["updated_at"] or "", r["thread_id"]), reverse=True)
-            cached = {"results": results, "warnings": warnings, "captured_at": utc(time.time()), "created": time.time(),
-                      "proofs": {r["thread_id"]: config["threads"][r["thread_id"]].get("_proof") for r in results}}
-            snapshot_id, start = secrets.token_hex(12), 0
-            with self._lock:
-                self._find_cache = {k: v for k, v in self._find_cache.items() if time.time() - v["created"] < CURSOR_TTL}
-                if len(self._find_cache) >= 16:
-                    self._find_cache.pop(next(iter(self._find_cache)))
-                self._find_cache[snapshot_id] = cached
-        self._revalidate(config, {tid: rows[tid] for tid in cached["proofs"] if tid in rows})
-        end = min(start + limit, len(cached["results"]))
-        has_more = end < len(cached["results"])
-        return {"source": BACKEND, "threads": cached["results"][start:end], "has_more": has_more,
-                "next_cursor": self._token(config, "find", snapshot_id=snapshot_id, position=end, parameters=parameters) if has_more else None,
-                "search_snapshot_at": cached["captured_at"], "scope_count": len(config["threads"]),
-                "coverage_complete": not cached["warnings"], "warnings": cached["warnings"],
-                "note": "Only explicit grants and verified repository-inherited threads are searched. Same titles are distinct IDs; ask the user to choose. "
-                        "Search results freeze metadata/matches; content matches use individual file snapshots. "
-                        "Unrelated/projectless records are not listed. Unresolved attributable records appear only as aggregate warnings; "
-                        "explicit configuration can bind an approved exception. Empty results do not prove no Codex history."}
+            current.pop('projection',None)
+        return current
 
-    def read_codex_thread(self, thread_id, cursor="", limit=20, max_chars=16000, include_tool_refs=False):
-        config, rows = self._request(thread_id)
-        grant = self._authorized(config, thread_id)
-        integer(limit, "limit", 1, 50)
-        integer(max_chars, "max_chars", 100, 40000)
-        if type(include_tool_refs) is not bool:
-            raise AccessError("include_tool_refs must be boolean.")
-        if include_tool_refs and not grant.get("allow_tool_results", False):
-            raise AccessError("Tool evidence is separately disabled for this thread.")
-        parameters = {"limit": limit, "max_chars": max_chars, "include_tool_refs": include_tool_refs}
-        token = self._verify(cursor, config, "messages", thread_id) if cursor else None
-        if token and token["parameters"] != parameters:
-            raise AccessError("Read cursor belongs to different page parameters.")
-        row = rows.get(thread_id)
-        if row is None:
-            raise AccessError("Authorized thread metadata is missing; history is not proven empty.")
-        projection, snapshot, appended = self._snapshot(config, row, token["snapshot"] if token else None)
-        sequence = list(projection["messages"])
+    def _snapshot(self, config, metadata, expected=None):
+        """Return only a fully verified cached projection (also a test injection seam)."""
+        current = self._verified[metadata['id']]
+        key = expected['id'] if expected else current.get('snapshot_id')
+        cached = self._snapshots.get(key)
+        if cached is None:
+            raise AccessError('Snapshot unavailable; restart the read.', code='snapshot_expired')
+        cached['created'] = time.monotonic()
+        return cached['projection'],cached['snapshot'],current['stamp'][2]>cached['snapshot']['bytes']
+
+    def _revalidate_iter(self, config, rows, snapshots=None):
+        fresh = self._configuration()
+        if fresh['scope'] != config['scope']:
+            raise AccessError('History authorization or repository topology changed; start a fresh read.',code='authorization_changed')
+        for tid,row in rows.items():
+            current = self._metadata(fresh, tid).get(tid)
+            if current is None:
+                raise AccessError('Thread metadata is unavailable.',code='unverifiable_source')
+            try:
+                yield from self._ensure_iter(fresh,current,expected=(snapshots or {}).get(tid))
+                grant, _ = self._derive(fresh,current)
+            except AccessError as exc:
+                if exc.code in {'unauthorized','unverifiable_source'}:
+                    raise AccessError('Thread association changed or was revoked; start a fresh read.',code='authorization_changed') from None
+                raise
+            old = config['threads'].get(tid)
+            if not grant or not old or not self._compatible_grant(old,grant):
+                raise AccessError('Thread association changed or was revoked; start a fresh read.',code='authorization_changed')
+            fresh['threads'][tid]=grant
+            yield {'phase':'authorization_check'}
+        # Check config again after any suspended source verification.
+        if self._configuration()['scope'] != config['scope']:
+            raise AccessError('History authorization changed before return.',code='authorization_changed')
+        for tid, row in rows.items():
+            latest = self._metadata(fresh,tid).get(tid)
+            if not latest or any(latest[k] != row[k] for k in ('cwd','rollout_path')):
+                raise AccessError('Thread association changed before return.',code='authorization_changed')
+            with self._open_rollout(fresh, row) as fd:
+                if stamp(os.fstat(fd)) != self._verified[tid]['stamp']:
+                    raise AccessError('Source changed during final checks; retry when stable.', code='waiting_source_stable')
+        return fresh
+
+    def read_codex_thread(self, thread_id, cursor='', limit=20, max_chars=16000, include_tool_refs=False,
+                          view='all', turn_id=''):
+        return self._drain(self._read_codex_thread_iter(thread_id,cursor,limit,max_chars,include_tool_refs,view,turn_id))
+
+    def _read_codex_thread_iter(self, thread_id, cursor='', limit=20, max_chars=16000, include_tool_refs=False,
+                               view='all', turn_id=''):
+        config = self._configuration()
+        integer(limit,'limit',1,50);integer(max_chars,'max_chars',100,40000)
+        if not isinstance(thread_id,str) or not ID_PATTERN.fullmatch(thread_id):
+            raise AccessError('Thread is not authorized.',code='unauthorized')
+        if type(include_tool_refs) is not bool or view not in ('all','latest_turn','turn') or not isinstance(turn_id,str) or len(turn_id)>200:
+            raise AccessError('Invalid history view parameters.')
+        if (view=='turn') != bool(turn_id):
+            raise AccessError('Supply turn_id only for view=turn.')
+        rows=self._metadata(config,thread_id);row=rows.get(thread_id)
+        if row is None or not self._eligible(config,row):raise AccessError('Thread is not authorized.',code='unauthorized')
+        # Verify parameter-bound signatures after current association has been derived.
+        yield from self._ensure_iter(config,row)
+        grant,reason=self._derive(config,row)
+        if not grant:raise AccessError('Thread is not authorized.',code='unverifiable_source')
+        config['threads'][thread_id]=grant
+        if include_tool_refs and not grant.get('allow_tool_results',False):
+            raise AccessError('Tool evidence is separately disabled for this thread.')
+        parameters={'limit':limit,'max_chars':max_chars,'include_tool_refs':include_tool_refs,'view':view,'turn_id':turn_id}
+        token=self._verify(cursor,config,'messages',thread_id) if cursor else None
+        if token and token['parameters']!=parameters:raise AccessError('Read cursor belongs to different page parameters.')
+        yield from self._ensure_iter(config,row,expected=token['snapshot'] if token else None,projection=not token)
+        projection,snapshot,appended=self._snapshot(config,row,token['snapshot'] if token else None)
+        selected=token.get('selected_turn') if token else None
+        if view!='all' and selected is None:
+            selected=turn_id if view=='turn' else projection.get('latest_turn_id')
+            if selected is None or selected not in projection.get('turn_ids',[]) or selected in projection.get('ambiguous_turn_ids',[]):
+                raise AccessError('No reliable matching turn; use view=all.',code='turn_unavailable')
+        sequence=[m for m in projection['messages'] if view=='all' or m['turn_id']==selected]
         if include_tool_refs:
-            sequence.extend(projection["tools"].values())
-            sequence.sort(key=lambda entry: entry["source_line"])
-        position, offset = (token["position"], token["offset"]) if token else (0, 0)
-        start_position, start_offset = position, offset
-        page, budget, fragmented = [], max_chars, False
-        while position < len(sequence) and len(page) < limit and budget > 0:
-            entry = sequence[position]
-            if entry["kind"] == "tool_reference":
-                page.append({key: value for key, value in entry.items() if key != "_item"})
-                page[-1]["item_id"] = self._token(config, "item", thread=thread_id, snapshot=snapshot, line=entry["source_line"])
-                budget -= 500
-                position += 1
-                continue
-            text = entry["text"]
-            end = min(len(text), offset + budget)
-            page.append({**entry, "text": text[offset:end], "part_offset": offset, "total_characters": len(text),
-                         "has_more_text": end < len(text)})
-            budget -= end - offset
-            fragmented |= offset > 0 or end < len(text)
-            if end < len(text):
-                offset = end
-                break
-            position += 1
-            offset = 0
-        has_more = position < len(sequence)
-        self._revalidate(config, {thread_id: row})
-        return {"thread": self._summary(config, row), "source": BACKEND, "snapshot": snapshot,
-                "inherited_context": {"stored_ancestor_headers": projection["inherited_metadata_records"], "followed_other_threads": False},
-                "source_cli_version": sanitize(projection["meta"].get("cli_version"))[0][:100],
-                "storage_history_mode": projection["meta"].get("history_mode") if projection["meta"].get("history_mode") in ("legacy", "paginated") else "unknown",
-                "entries": page, "order": "oldest_first_record_order", "range": {
-                    "start_entry": start_position, "start_character": start_offset,
-                    "next_entry": position, "next_character": offset, "total_entries": len(sequence)},
-                "next_cursor": self._token(config, "messages", thread=thread_id, snapshot=snapshot,
-                                            position=position, offset=offset, parameters=parameters) if has_more else None,
-                "has_more": has_more, "text_fragmented": fragmented, "appended_since_snapshot": appended,
-                "complete_public_projection": projection["complete_public_projection"], "warnings": projection["warnings"],
-                "mirrored_messages_deduplicated": projection["mirrored_messages_deduplicated"],
-                "last_recorded_status": projection["last_recorded_status"], "is_running": None,
-                "tool_results_included": False, "tool_refs_included": include_tool_refs,
-                "limitations": list(COMMON_LIMITS)}
+            sequence.extend(t for t in projection['tools'].values() if view=='all' or t['turn_id']==selected)
+            sequence.sort(key=lambda e:e['source_line'])
+        position,offset=(token['position'],token['offset']) if token else (0,0)
+        start_position,start_offset=position,offset
+        page,budget,fragmented=[],max_chars,False
+        while position<len(sequence) and len(page)<limit and budget>0:
+            entry=sequence[position]
+            if entry['kind']=='tool_reference':
+                page.append({k:v for k,v in entry.items() if not k.startswith('_')})
+                page[-1]['item_id']=self._token(config,'item',thread=thread_id,snapshot=snapshot,line=entry['source_line'])
+                budget-=500;position+=1;continue
+            text=entry['text'];end=min(len(text),offset+budget)
+            page.append({**entry,'text':text[offset:end],'part_offset':offset,'total_characters':len(text),'has_more_text':end<len(text)})
+            budget-=end-offset;fragmented|=offset>0 or end<len(text)
+            if end<len(text):offset=end;break
+            position+=1;offset=0
+        more=position<len(sequence)
+        yield from self._revalidate_iter(config,rows,{thread_id:snapshot})
+        current=self._verified[thread_id]
+        result={'thread':self._summary(config,row),'source':BACKEND,'snapshot':snapshot,
+                'inherited_context':{'stored_ancestor_headers':projection['inherited_metadata_records'],'followed_other_threads':False},
+                'source_cli_version':sanitize(projection['meta'].get('cli_version'))[0][:100],
+                'storage_history_mode':projection['meta'].get('history_mode') if projection['meta'].get('history_mode') in ('legacy','paginated') else 'unknown',
+                'entries':page,'order':'oldest_first_record_order','view':view,'selected_turn_id':selected,
+                'range':{'start_entry':start_position,'start_character':start_offset,'next_entry':position,'next_character':offset,'total_entries':len(sequence)},
+                'next_cursor':self._token(config,'messages',thread=thread_id,snapshot=snapshot,position=position,offset=offset,parameters=parameters,selected_turn=selected) if more else None,
+                'has_more':more,'text_fragmented':fragmented,'appended_since_snapshot':current['stamp'][2]>snapshot['bytes'],
+                'complete_public_projection':projection['complete_public_projection'],'warnings':projection['warnings'],
+                'mirrored_messages_deduplicated':projection['mirrored_messages_deduplicated'],'last_recorded_status':projection['last_recorded_status'],
+                'is_running':None,'tool_results_included':False,'tool_refs_included':include_tool_refs,'limitations':list(COMMON_LIMITS)}
+        return self._remember(result,config,rows,{thread_id:snapshot})
 
-    def read_codex_thread_item(self, thread_id, item_id, cursor="", max_chars=12000):
-        config, rows = self._request(thread_id)
-        grant = self._authorized(config, thread_id)
-        if not grant.get("allow_tool_results", False):
-            raise AccessError("Tool evidence is separately disabled for this thread.")
-        integer(max_chars, "max_chars", 100, 40000)
-        reference = self._verify(item_id, config, "item", thread_id)
-        item_hash = hashlib.sha256(item_id.encode()).hexdigest()
-        token = self._verify(cursor, config, "item_page", thread_id) if cursor else None
-        if token and (token["item_hash"] != item_hash or token["max_chars"] != max_chars):
-            raise AccessError("Item cursor does not belong to these parameters.")
-        row = rows.get(thread_id)
-        if row is None:
-            raise AccessError("Authorized thread metadata is missing.")
-        projection, snapshot, appended = self._snapshot(config, row, reference["snapshot"])
-        record = projection["tools"].get(reference["line"])
-        if record is None:
-            raise AccessError("Item is not a supported saved execution record.")
-        value, redactions = project_tool(record, grant.get("mcp_tools", []))
-        text = json.dumps(value, ensure_ascii=False, indent=2)
-        original_chars = len(text)
-        policy_truncated = original_chars > 64000
-        text = text[:64000]
-        start = token["offset"] if token else 0
-        end = min(start + max_chars, len(text))
-        has_more = end < len(text)
-        self._revalidate(config, {thread_id: row})
-        return {"thread_id": thread_id, "item_id": item_id, "type": record["type"],
-                "turn_id": record["turn_id"], "source_line": record["source_line"], "source": BACKEND,
-                "format": "field-whitelisted JSON text, not the raw record", "text": text[start:end],
-                "offset": start, "returned_through": end, "available_characters": len(text),
-                "original_projected_characters": original_chars, "truncated_by_policy": policy_truncated,
-                "redactions": redactions, "snapshot": snapshot, "appended_since_snapshot": appended,
-                "has_more": has_more, "next_cursor": self._token(config, "item_page", thread=thread_id,
-                    item_hash=item_hash, offset=end, max_chars=max_chars) if has_more else None,
-                "limitations": list(COMMON_LIMITS)}
+    def read_codex_thread_item(self,thread_id,item_id,cursor='',max_chars=12000):
+        return self._drain(self._read_codex_thread_item_iter(thread_id,item_id,cursor,max_chars))
+
+    def _read_codex_thread_item_iter(self,thread_id,item_id,cursor='',max_chars=12000):
+        config=self._configuration();integer(max_chars,'max_chars',100,40000)
+        if not isinstance(thread_id,str) or not ID_PATTERN.fullmatch(thread_id):raise AccessError('Thread is not authorized.')
+        rows=self._metadata(config,thread_id);row=rows.get(thread_id)
+        if row is None:raise AccessError('Thread is not authorized.')
+        yield from self._ensure_iter(config,row)
+        grant,_=self._derive(config,row)
+        if not grant or not grant.get('allow_tool_results',False):raise AccessError('Tool evidence is separately disabled for this thread.')
+        config['threads'][thread_id]=grant
+        reference=self._verify(item_id,config,'item',thread_id)
+        token=self._verify(cursor,config,'item_page',thread_id) if cursor else None
+        item_hash=hashlib.sha256(item_id.encode()).hexdigest()
+        if token and (token['item_hash']!=item_hash or token['max_chars']!=max_chars):raise AccessError('Item cursor does not belong to these parameters.')
+        yield from self._ensure_iter(config,row,expected=reference['snapshot'])
+        projection,snapshot,appended=self._snapshot(config,row,reference['snapshot'])
+        record=projection['tools'].get(reference['line'])
+        if record is None:raise AccessError('Item is not a supported saved execution record.')
+        with self._open_rollout(config,row) as fd:
+            before=stamp(os.fstat(fd))
+            if before!=self._verified[thread_id]['stamp']:raise AccessError('Source changed.',code='source_changed')
+            raw=os.pread(fd,record['_length'],record['_offset'])
+            if len(raw)!=record['_length'] or len(raw)>RECORD_BYTES:raise AccessError('Item source changed.',code='source_changed')
+            item=json.loads(raw)['payload']['item']
+            value,redactions=project_tool({**record,'_item':item},grant.get('mcp_tools',[]))
+            if stamp(os.fstat(fd))!=before:raise AccessError('Source changed.',code='source_changed')
+        text=json.dumps(value,ensure_ascii=False,indent=2);original_chars=len(text);text=text[:64000]
+        start=token['offset'] if token else 0;end=min(start+max_chars,len(text));more=end<len(text)
+        yield from self._revalidate_iter(config,rows,{thread_id:snapshot})
+        result={'thread_id':thread_id,'item_id':item_id,'type':record['type'],'turn_id':record['turn_id'],'source_line':record['source_line'],
+                'source':BACKEND,'format':'field-whitelisted JSON text, not the raw record','text':text[start:end],'offset':start,
+                'returned_through':end,'available_characters':len(text),'original_projected_characters':original_chars,
+                'truncated_by_policy':original_chars>64000,'redactions':redactions,'snapshot':snapshot,'appended_since_snapshot':appended,
+                'has_more':more,'next_cursor':self._token(config,'item_page',thread=thread_id,item_hash=item_hash,offset=end,max_chars=max_chars) if more else None,
+                'limitations':list(COMMON_LIMITS)}
+        return self._remember(result,config,rows,{thread_id:snapshot})
+
+    def find_codex_threads(self,query='',project_id='',cursor='',limit=10):
+        return self._drain(self._find_codex_threads_iter(query,project_id,cursor,limit))
+
+    def _find_codex_threads_iter(self,query='',project_id='',cursor='',limit=10):
+        config=self._configuration();integer(limit,'limit',1,20)
+        if not isinstance(query,str) or len(query)>200 or not isinstance(project_id,str):raise AccessError('Invalid search parameters.')
+        if project_id and project_id not in self.project_ids:raise AccessError('Unknown project filter.')
+        parameters={'query':query,'project_id':project_id,'limit':limit}
+        now=time.monotonic()
+        self._find_cache={k:v for k,v in self._find_cache.items() if now-v['created']<CURSOR_TTL}
+        if cursor:
+            token=self._verify(cursor,config,'find')
+            if token['parameters']!=parameters:raise AccessError('Search cursor belongs to different parameters.')
+            cached=self._find_cache.get(token['snapshot_id'])
+            if cached is None:raise AccessError('Search snapshot expired; repeat the search.',code='snapshot_expired')
+            start,snapshot_id=token['position'],token['snapshot_id']
+            for tid,old in cached['grants'].items():config['threads'][tid]=old
+        else:
+            rows=self._metadata(config,project_id=project_id,query=query)
+            needle=query.casefold()
+            candidates=sorted(rows.values(),key=lambda r:(not any(needle in str(r.get(k) or '').casefold() for k in ('name','title','cwd','id')),r['id']))
+            results,warnings,used,grants=[],[],{},{}
+            unverified = False
+            if config.get('metadata_only_candidates'):
+                warnings.append({'reason':'candidate_budget_metadata_only_search'})
+            content_bytes=0;content_seconds=0
+            for row in candidates:
+                if not self._eligible(config,row):continue
+                begin=time.monotonic()
+                try:
+                    yield from self._ensure_iter(config,row)
+                    grant,reason=self._derive(config,row)
+                    if not grant:raise AccessError('Association cannot be verified.',code='unverifiable_source')
+                    config['threads'][row['id']]=grant
+                    if project_id and grant.get('project_id') != project_id:
+                        continue
+                    summary=self._summary(config,row)
+                    match=not needle or any(needle in str(summary.get(k) or '').casefold() for k in ('title','label','cwd','project_id','thread_id'))
+                    if match:
+                        summary['match']={'in':'metadata','query':query}
+                    elif content_bytes>=128*1024*1024 or content_seconds>=15:
+                        warnings.append({'reason':'content_search_budget_exhausted'});continue
+                    else:
+                        existing_snapshots = set(self._snapshots)
+                        try:
+                            yield from self._ensure_iter(config,row,projection=True)
+                            projected,snap,_=self._snapshot(config,row)
+                            content_bytes+=snap['bytes'];content_seconds+=time.monotonic()-begin
+                            if projected['warnings']:warnings.append({'reason':'partial_public_projection'})
+                            message=next((m for m in projected['messages'] if needle in m['text'].casefold()),None)
+                            match=message is not None
+                            if match:
+                                index=message['text'].casefold().find(needle)
+                                summary['match']={'in':'public_message','message_id':message['message_id'],'snippet':message['text'][max(0,index-60):index+180],'snapshot_sha256':snap['sha256']}
+                            del projected, message
+                        finally:
+                            # Search exports a bounded snippet, not a content-page
+                            # cursor. Its private temporary projection must not pin
+                            # the entire read cache and prevent the selected read.
+                            for key in set(self._snapshots)-existing_snapshots:
+                                if self._snapshots[key]['row_id']==row['id']:
+                                    self._snapshots.pop(key,None)
+                    if match:
+                        results.append(summary);used[row['id']]=row;grants[row['id']]=grant
+                except AccessError as exc:
+                    if exc.code=='authorization_changed':raise
+                    # No rejected candidate identifiers or titles in output.
+                    unverified = True
+                yield {'phase':'candidate_scan'}
+            counts={}
+            for w in warnings:counts[w['reason']]=counts.get(w['reason'],0)+1
+            warnings=[{'reason':reason,'count':count} for reason,count in counts.items()]
+            if unverified:
+                warnings.append({'reason':'coverage_unverified'})
+            results.sort(key=lambda r:(r['updated_at'] or '',r['thread_id']),reverse=True)
+            if len(self._find_cache)>=16:raise AccessError('Search snapshot budget exhausted.',code='resource_exhausted')
+            cached={'results':results,'warnings':warnings,'captured_at':utc(time.time()),'created':now,'rows':used,'grants':grants}
+            snapshot_id,start=secrets.token_hex(12),0;self._find_cache[snapshot_id]=cached
+        yield from self._revalidate_iter(config,cached['rows'])
+        cached['created'] = time.monotonic()
+        end=min(start+limit,len(cached['results']));more=end<len(cached['results'])
+        result={'source':BACKEND,'threads':cached['results'][start:end],'has_more':more,'results_have_more':more,
+                'scan_complete':True,'next_cursor':self._token(config,'find',snapshot_id=snapshot_id,position=end,parameters=parameters) if more else None,
+                'search_snapshot_at':cached['captured_at'],'scope_count':len(cached['grants']),
+                'coverage_complete':not cached['warnings'],'warnings':cached['warnings'],
+                'note':'Fixed bounded metadata candidate set. Only verified results are returned. New threads require a new search; warnings mean coverage is incomplete.'}
+        return self._remember(result,config,cached['rows'])

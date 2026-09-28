@@ -15,6 +15,10 @@ import time
 class AccessError(ValueError):
     """A safe message that can be returned to a tool caller."""
 
+    def __init__(self, message, *, code=None):
+        self.code = code or "access_denied"
+        super().__init__(f"[{code}] {message}" if code else message)
+
 
 BLOCKED_NAMES = {
     ".git", ".ssh", ".aws", ".azure", ".gnupg", ".npmrc", ".pypirc",

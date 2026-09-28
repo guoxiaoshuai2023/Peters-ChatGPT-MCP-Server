@@ -140,7 +140,7 @@ class InheritanceTests(unittest.TestCase):
             db.execute('UPDATE threads SET rollout_path=? WHERE id=?', (str(path), FIRST))
         result = self.history.find_codex_threads()
         self.assertEqual(result['threads'], [])
-        self.assertTrue(any(w['reason'] == 'recorded_context_missing_foreign_or_cross_project' for w in result['warnings']))
+        self.assertTrue(any(w['reason'] == 'coverage_unverified' for w in result['warnings']))
         for marker in (FIRST, 'CROSS_SECRET', '同名任务'):
             self.assertNotIn(marker, json.dumps(result, ensure_ascii=False))
         with self.assertRaises(AccessError):
@@ -161,7 +161,7 @@ class InheritanceTests(unittest.TestCase):
         result = self.history.find_codex_threads()
         self.assertEqual(result['threads'], [])
         self.assertFalse(result['coverage_complete'])
-        self.assertTrue(any(w['reason'] == 'recorded_context_missing_foreign_or_cross_project' for w in result['warnings']))
+        self.assertTrue(any(w['reason'] == 'coverage_unverified' for w in result['warnings']))
         for marker in (FIRST, SECOND, THIRD, 'CROSS_SECRET', 'FOREIGN_SECRET', '同名任务'):
             self.assertNotIn(marker, json.dumps(result))
         for tid in (FIRST, SECOND, THIRD):

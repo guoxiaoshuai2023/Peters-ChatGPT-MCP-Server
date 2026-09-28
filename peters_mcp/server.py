@@ -24,6 +24,10 @@ def create_server(catalog: Catalog, audit: logging.Logger | None = None, history
     from .history_process import IsolatedHistory
     history_service = IsolatedHistory(history) if history.config_path is not None else history
 
+    if audit and isinstance(history_service, IsolatedHistory):
+        history_service.set_diagnostic_sink(
+            lambda event: audit.info(json.dumps({"component": "history_worker", **event}, ensure_ascii=True)))
+
     @asynccontextmanager
     async def lifespan(_server):
         try:

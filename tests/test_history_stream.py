@@ -4,14 +4,121 @@ import json
 import os
 import sqlite3
 import unittest
+import gc
+import weakref
 from unittest.mock import patch
 
 from peters_mcp.catalog import AccessError
+from peters_mcp.history import HistoryAccess
+from peters_mcp.history_process import _frame, RESPONSE_BYTES
 from tests import test_history as explicit
 from tests import test_history_inheritance as inherited
 
 
 class HistoryStreamTests(unittest.TestCase):
+    def test_private_recipe_is_released_with_result_and_rejected_by_other_engine(self):
+        class Marker:
+            pass
+
+        owner = HistoryAccess()
+        other = HistoryAccess()
+        self.addCleanup(owner.close)
+        self.addCleanup(other.close)
+        marker = Marker()
+        reference = weakref.ref(marker)
+        result = owner._remember({}, {'private_marker': marker}, {})
+        del marker
+        gc.collect()
+        self.assertIsNotNone(reference())
+        with self.assertRaises(AccessError) as failure:
+            other._drain(other.revalidate_result_iter('read_codex_thread', {}, result))
+        self.assertEqual(failure.exception.code, 'restart_required')
+        del result
+        gc.collect()
+        self.assertIsNone(reference())
+
+    def test_reused_prefixes_do_not_hide_later_foreign_context(self):
+        fixture = self.fixture()
+        path = fixture.thread()
+        history = fixture.history
+        first = history.read_codex_thread(inherited.FIRST, limit=1)
+        with path.open('a') as stream:
+            stream.write(inherited.encoded([inherited.message('safe public append')]))
+        for _ in range(12):
+            old = history.read_codex_thread(inherited.FIRST, limit=1, cursor=first['next_cursor'])
+            latest = history.read_codex_thread(inherited.FIRST)
+            self.assertEqual(old['snapshot'], first['snapshot'])
+            self.assertEqual(latest['entries'][-1]['text'], 'safe public append')
+            self.assertEqual(len(history._snapshots), 2)
+        with path.open('a') as stream:
+            stream.write(inherited.encoded([inherited.record('turn_context', {
+                'cwd': str(fixture.foreign), 'turn_id': 'foreign-turn'})]))
+        for arguments in ({'limit': 1, 'cursor': first['next_cursor']}, {}):
+            with self.subTest(old_cursor=bool(arguments)):
+                with self.assertRaises(AccessError) as failure:
+                    history.read_codex_thread(inherited.FIRST, **arguments)
+                self.assertEqual(failure.exception.code, 'unverifiable_source')
+
+    def test_delayed_result_survives_later_pages_without_serializing_private_recipe(self):
+        fixture = self.fixture(explicit.HistoryTests)
+        history = fixture.history
+        first = history.read_codex_thread(explicit.FIRST, limit=1)
+        # Keep every result alive, as worker tasks do while processing tokens
+        # remain valid. A separate 16-recipe FIFO used to invalidate first.
+        retained = [history.read_codex_thread(explicit.FIRST, limit=1) for _ in range(24)]
+        delivered = history._drain(history.revalidate_result_iter('read_codex_thread', {}, first))
+        self.assertIs(delivered, first)
+        self.assertEqual(len(retained), 24)
+        self.assertEqual(delivered['entries'][0]['text'], '需求：分批读取文档。')
+        serialized = _frame(delivered, RESPONSE_BYTES)[4:]
+        self.assertEqual(json.loads(serialized), dict(delivered))
+        for private in ('_validation_recipe', '_validation_owner', 'rollout_path',
+                        str(fixture.home), str(fixture.path), str(fixture.config)):
+            self.assertNotIn(private, serialized.decode())
+        fixture.grants.clear()
+        fixture.save_config()
+        with self.assertRaises(AccessError) as failure:
+            history._drain(history.revalidate_result_iter('read_codex_thread', {}, first))
+        self.assertEqual(failure.exception.code, 'authorization_changed')
+
+    def test_private_result_recipe_does_not_survive_engine_close_or_json_copy(self):
+        fixture = self.fixture(explicit.HistoryTests)
+        history = fixture.history
+        result = history.read_codex_thread(explicit.FIRST, limit=1)
+        with self.assertRaises(AccessError) as failure:
+            history._drain(history.revalidate_result_iter('read_codex_thread', {}, dict(result)))
+        self.assertEqual(failure.exception.code, 'restart_required')
+        history.close()
+        with self.assertRaises(AccessError) as failure:
+            history._drain(history.revalidate_result_iter('read_codex_thread', {}, result))
+        self.assertEqual(failure.exception.code, 'restart_required')
+
+    def test_old_and_current_pages_reuse_two_snapshots_after_one_append(self):
+        fixture = self.fixture(explicit.HistoryTests)
+        history = fixture.history
+        first = history.read_codex_thread(explicit.FIRST, limit=1)
+        with fixture.path.open('ab') as stream:
+            stream.write(explicit.encode([explicit.message('new public append', native_id='append-one')]))
+        current_id = None
+        for _ in range(12):
+            older = history.read_codex_thread(explicit.FIRST, limit=1, cursor=first['next_cursor'])
+            current = history.read_codex_thread(explicit.FIRST)
+            self.assertEqual(older['snapshot'], first['snapshot'])
+            self.assertEqual(older['entries'][0]['text'], '公开进度')
+            self.assertTrue(older['appended_since_snapshot'])
+            self.assertEqual(current['entries'][-1]['text'], 'new public append')
+            current_id = current_id or current['snapshot']['id']
+            self.assertEqual(current['snapshot']['id'], current_id)
+            self.assertEqual(len(history._snapshots), 2)
+        # A genuinely new source version cannot inherit the previous current
+        # projection or hide another appended public message.
+        with fixture.path.open('ab') as stream:
+            stream.write(explicit.encode([explicit.message('second public append', native_id='append-two')]))
+        latest = history.read_codex_thread(explicit.FIRST)
+        self.assertNotEqual(latest['snapshot']['id'], current_id)
+        self.assertEqual(latest['entries'][-1]['text'], 'second public append')
+        self.assertEqual(len(history._snapshots), 3)
+
     def test_mutation_between_scan_slices_discards_partial_proof(self):
         fixture = self.fixture(explicit.HistoryTests)
         payload = explicit.encode([explicit.record('response_item', {

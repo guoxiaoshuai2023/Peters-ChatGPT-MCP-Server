@@ -28,6 +28,8 @@ from .catalog import AccessError
 OPERATIONS = frozenset(("find_codex_threads", "read_codex_thread", "read_codex_thread_item"))
 REQUEST_BYTES = 64 * 1024
 RESPONSE_BYTES = 256 * 1024
+STAGES = frozenset(("_configuration", "_metadata", "_derive", "_snapshot"))
+PHASES = frozenset(("new", "operation", "validation", "scanning", "finalizing", "authorization_check", "candidate_scan", "delivery", "done", "unknown"))
 CURSOR_TTL = 1800
 PREFIX = "hp1."
 
@@ -95,6 +97,8 @@ def _worker(connection, spec, factory, task_ttl):
         peak = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
         value["peak_rss_bytes"] = int(peak if sys.platform == "darwin" else peak * 1024)
         packet = memoryview(_frame(value, RESPONSE_BYTES))
+        if value["type"] == "delivery":
+            send({"type": "delivery_begin", "bytes": len(packet)})
         deadline = time.monotonic() + 1
         while packet:
             if time.monotonic() > deadline:
@@ -117,6 +121,20 @@ def _worker(connection, spec, factory, task_ttl):
 
     try:
         core = (factory or _engine)(spec)
+        def observe_stage(name, method):
+            def observed(*args, **kwargs):
+                started = time.monotonic()
+                send({"type": "stage", "stage": name})
+                try:
+                    return method(*args, **kwargs)
+                finally:
+                    send({"type": "stage_done", "stage": name,
+                          "elapsed_ms": int(1000 * (time.monotonic() - started))})
+            return observed
+        for name in STAGES:
+            method = getattr(core, name, None)
+            if method is not None:
+                setattr(core, name, observe_stage(name, method))
         send({"type": "boot"})
         while True:
             runnable = any(t["iterator"] is not None or t["demands"] for t in tasks.values())
@@ -172,7 +190,8 @@ def _worker(connection, spec, factory, task_ttl):
                 continue
             if task["phase"] == "done" and not task["demands"]:
                 continue
-            send({"type": "step", "id": tid})
+            send({"type": "step", "id": tid, "phase": task["phase"],
+                  "checkpoint": task.get("checkpoint", "unknown")})
             try:
                 if task["phase"] == "new":
                     task["iterator"] = iter(core.operation_iter(task["operation"], task["arguments"]))
@@ -182,7 +201,9 @@ def _worker(connection, spec, factory, task_ttl):
                         task["operation"], task["arguments"], task["result"]))
                     task["phase"] = "validation"
                 try:
-                    next(task["iterator"])
+                    checkpoint = next(task["iterator"])
+                    phase = checkpoint.get("phase") if isinstance(checkpoint, dict) else None
+                    task["checkpoint"] = phase if phase in PHASES else "unknown"
                 except StopIteration as finished:
                     if not isinstance(finished.value, dict):
                         raise ValueError("invalid history result")
@@ -191,6 +212,7 @@ def _worker(connection, spec, factory, task_ttl):
                     task["iterator"] = None
                     task["phase"] = "done"
                     if validating:
+                        send({"type": "delivery_start"})
                         # A late result is retained only in the child. A later demand
                         # will run validation again rather than receiving this page.
                         for nonce, expiry in task["demands"].items():
@@ -209,8 +231,11 @@ def _worker(connection, spec, factory, task_ttl):
             finally:
                 send({"type": "idle"})
     except Exception:
-        # Never print an exception containing source records or configuration.
-        pass
+        # Fixed control label only: never serialize exception text or source data.
+        try:
+            send({"type": "fatal"})
+        except Exception:
+            pass
     finally:
         connection.close()
 
@@ -244,11 +269,36 @@ class IsolatedHistory:
         self._keys = {}
         self._waiters = {}
         self._closed = False
+        self._epoch = 0
+        self._serial = 0
+        self._diagnostics = deque(maxlen=256)
+        self._diagnostic_sink = None
+        self._stops = deque(maxlen=16)
+        self._active = {}
         self._step_started = None
         self._rss = 0
         self._peak_rss = 0
         self._monitor = threading.Thread(target=self._supervise, name="history-supervisor", daemon=True)
         self._monitor.start()
+
+    def set_diagnostic_sink(self, sink):
+        """Operational events only; callers must not add request/source context."""
+        with self._lock:
+            self._diagnostic_sink = sink
+
+    def diagnostic_events(self):
+        with self._lock:
+            return [dict(event) for event in self._diagnostics]
+
+    def _diagnose(self, event, **metrics):
+        # All values originate from fixed labels and counters below, never args.
+        record = {"event": event, "epoch": self._epoch, **metrics}
+        self._diagnostics.append(record)
+        if self._diagnostic_sink is not None:
+            try:
+                self._diagnostic_sink(dict(record))
+            except Exception:
+                pass
 
     def _start(self):
         parent, child = socket.socketpair()
@@ -264,6 +314,9 @@ class IsolatedHistory:
         child.close()
         parent.setblocking(False)
         self._process, self._socket = process, parent
+        self._epoch += 1
+        self._active = {}
+        self._diagnose("worker_start")
         self._started = time.monotonic()
         self._booted = False
         self._step_started = None
@@ -275,8 +328,15 @@ class IsolatedHistory:
             raise AccessError("History request queue is full; retry shortly.", code="busy")
         self._outgoing.extend(packet)
 
-    def _stop(self, status):
+    def _stop(self, status, reason="explicit_close"):
         process = self._process
+        if process is not None:
+            self._stops.append((self._generation, reason))
+            self._diagnose("worker_stop", reason=reason, status=status,
+                           waiters=len(self._waiters), tasks=len(self._tasks),
+                           rss_bytes=self._rss, peak_rss_bytes=self._peak_rss,
+                           elapsed_ms=int(1000 * (time.monotonic() - self._step_started)) if self._step_started else 0,
+                           exitcode=process.exitcode, incoming_bytes=len(self._incoming), outgoing_bytes=len(self._outgoing), **self._active)
         if process is not None:
             if process.is_alive():
                 process.terminate()
@@ -302,6 +362,32 @@ class IsolatedHistory:
             waiter["event"].set()
         self._step_started = None
 
+    def _receive_messages(self):
+        # Drain already available IPC before deciding a worker has stalled.
+        # A frame can arrive in many short reads, with the worker's idle marker
+        # queued behind it. Both storage and work per pass remain bounded.
+        received = 0
+        deadline = time.monotonic() + 0.05
+        for _ in range(64):
+            try:
+                data = self._socket.recv(RESPONSE_BYTES + 4)
+            except BlockingIOError:
+                return
+            if not data:
+                self._stop("restart_required", "ipc_eof")
+                return
+            self._incoming.extend(data)
+            received += len(data)
+            yield from _messages(self._incoming, RESPONSE_BYTES)
+            if self._socket is None:
+                return
+            # Positive byte movement during a bounded delivery is observable
+            # progress, even before JSON framing is complete. No bytes, no reset.
+            if self._step_started is not None and self._active.get("phase") == "delivery":
+                self._step_started = time.monotonic()
+            if received >= 2 * RESPONSE_BYTES or time.monotonic() >= deadline:
+                return
+
     def _supervise(self):
         while True:
             time.sleep(0.01)
@@ -318,28 +404,57 @@ class IsolatedHistory:
                             del self._outgoing[:sent]
                         except BlockingIOError:
                             pass
-                    try:
-                        data = self._socket.recv(RESPONSE_BYTES + 4)
-                        if not data:
-                            self._stop("restart_required")
-                            continue
-                        self._incoming.extend(data)
-                    except BlockingIOError:
-                        pass
-                    for msg in _messages(self._incoming, RESPONSE_BYTES):
+                    for msg in self._receive_messages():
                         peak = msg.get("peak_rss_bytes", 0)
                         if type(peak) is not int or peak < 0:
                             raise ValueError("invalid peak memory measurement")
                         self._peak_rss = max(self._peak_rss, peak)
                         if peak > self._worker_rss:
-                            self._stop("resource_exhausted")
+                            self._stop("resource_exhausted", "peak_rss")
                             break
                         if msg["type"] == "boot":
                             self._booted = True
                         elif msg["type"] == "step":
                             self._step_started = now
+                            task = self._tasks.get(msg["id"], {})
+                            self._active = {"task": task.get("serial", 0),
+                                            "operation": task.get("operation", "unknown"),
+                                            "phase": msg.get("phase") if msg.get("phase") in PHASES else "unknown",
+                                            "checkpoint": msg.get("checkpoint") if msg.get("checkpoint") in PHASES else "unknown"}
                         elif msg["type"] == "idle":
+                            if self._step_started is not None:
+                                elapsed = int(1000 * (time.monotonic() - self._step_started))
+                                if elapsed >= 1000:
+                                    self._diagnose("slow_step", elapsed_ms=elapsed, **self._active)
                             self._step_started = None
+                        elif msg["type"] == "delivery_start":
+                            self._active["phase"] = "delivery"
+                        elif msg["type"] == "delivery_begin":
+                            size = msg.get("bytes")
+                            if type(size) is not int or not 4 <= size <= RESPONSE_BYTES + 4:
+                                raise ValueError("invalid delivery size")
+                            self._active["response_bytes"] = size
+                        elif msg["type"] == "stage" and msg.get("stage") in STAGES:
+                            self._active["stage"] = msg["stage"]
+                            self._active["stage_state"] = "running"
+                        elif msg["type"] == "stage_done" and msg.get("stage") in STAGES:
+                            self._active["stage_state"] = "completed"
+                            elapsed = msg.get("elapsed_ms")
+                            if type(elapsed) is not int or elapsed < 0:
+                                raise ValueError("invalid stage duration")
+                            if elapsed >= 1000:
+                                self._diagnose("slow_stage", elapsed_ms=elapsed, **self._active)
+                            if elapsed > self._step_seconds * 1000:
+                                self._stop("processing_timeout", "step_timeout")
+                                break
+                            # A completed bounded check is real progress. Keep the
+                            # final authorization guard synchronous: no other task
+                            # can run here and no timer heartbeat hides a stuck call.
+                            if self._step_started is not None:
+                                self._step_started = time.monotonic()
+                        elif msg["type"] == "fatal":
+                            self._stop("restart_required", "worker_fatal")
+                            break
                         elif msg["type"] == "complete" and msg["id"] in self._tasks:
                             task = self._tasks[msg["id"]]
                             # A completion already on the socket cannot release a
@@ -347,6 +462,12 @@ class IsolatedHistory:
                             if msg["revision"] == task["revision"]:
                                 task["complete"] = True
                         elif msg["type"] == "delivery":
+                            # One whole bounded response has crossed IPC. Several
+                            # duplicate waiters must not look like a stalled parser
+                            # merely because their successful sends accumulate.
+                            if self._step_started is not None:
+                                self._step_started = time.monotonic()
+                            self._diagnose("delivery_complete", **self._active)
                             waiter = self._waiters.get(msg["nonce"])
                             if waiter is not None and waiter["id"] == msg["id"]:
                                 waiter["reply"] = msg
@@ -354,18 +475,18 @@ class IsolatedHistory:
                     if self._process is None:
                         continue
                     if not self._process.is_alive():
-                        self._stop("restart_required")
+                        self._stop("restart_required", "worker_exit")
                     elif ((not self._booted and now - self._started > 5) or
                           (self._step_started is not None and now - self._step_started > self._step_seconds)):
-                        self._stop("processing_timeout")
+                        self._stop("processing_timeout", "boot_timeout" if not self._booted else "step_timeout")
                     elif now - self._last_rss_check >= 0.2:
                         self._last_rss_check = now
                         self._rss = _rss_bytes(self._process.pid)
                         self._peak_rss = max(self._peak_rss, self._rss)
                         if self._rss > self._worker_rss:
-                            self._stop("resource_exhausted")
+                            self._stop("resource_exhausted", "live_rss")
                 except Exception:
-                    self._stop("restart_required")
+                    self._stop("restart_required", "supervisor_failure")
 
     def _token(self, task):
         value = {"id": task["id"], "op": task["operation"], "key": task["key"],
@@ -408,6 +529,8 @@ class IsolatedHistory:
             if isinstance(token, str) and token.startswith(PREFIX):
                 value = self._verify(token, operation)
                 if value["generation"] != self._generation:
+                    reason = next((r for g, r in self._stops if g == value["generation"]), "expired_diagnostic")
+                    self._diagnose("stale_continuation", reason=reason)
                     return {"status": "restart_required", "continue_with": "Start a fresh call without the previous cursor."}
                 task = self._tasks.get(value["id"])
                 if task is None or time.monotonic() - task["touched"] > self._ttl:
@@ -438,7 +561,8 @@ class IsolatedHistory:
                             if self._keys.get(old["key"]) == tid:
                                 self._keys.pop(old["key"], None)
                     tid = secrets.token_hex(16)
-                    task = {"id": tid, "key": key, "operation": operation, "arguments": arguments,
+                    self._serial += 1
+                    task = {"id": tid, "serial": self._serial, "key": key, "operation": operation, "arguments": arguments,
                             "complete": False, "revision": 0, "attempt": 0,
                             "retry": False, "touched": time.monotonic()}
                     self._queue({"type": "submit", "id": tid, "operation": operation, "arguments": arguments})

@@ -17,10 +17,35 @@ class SyntheticEngine:
     def __init__(self, spec):
         self.path = spec["config_path"]
         self.calls = 0
+        if self.path and json.loads(Path(self.path).read_text()).get("slow_delivery"):
+            # Child-only wire delay: exercise several bounded sends in one
+            # delivery step without relying on the host's socket throughput.
+            from peters_mcp import history_process
+            original = history_process._frame
+            def delayed_frame(value, maximum):
+                if value.get("type") == "delivery":
+                    time.sleep(json.loads(Path(self.path).read_text()).get("delivery_delay", 0.08))
+                return original(value, maximum)
+            history_process._frame = delayed_frame
+
+    def _configuration(self, delay=0.08):
+        time.sleep(delay)
+
+    def _metadata(self):
+        time.sleep(0.08)
+
+    def _derive(self):
+        time.sleep(0.08)
 
     def operation_iter(self, operation, arguments):
         self.calls += 1
         marker = arguments.get("thread_id", arguments.get("query", ""))
+        if marker == "completed_stages":
+            self._configuration()
+            self._metadata()
+            self._derive()
+        if marker == "blocked_stage":
+            self._configuration(1)
         if marker == "hang":
             while True:
                 time.sleep(0.01)
@@ -41,10 +66,15 @@ class SyntheticEngine:
             raise AccessError("Synthetic source is still changing.", code="waiting_source_stable")
         if marker == "unexpected":
             raise RuntimeError("THIS_PRIVATE_BODY_MUST_NOT_APPEAR")
-        return {"status": "ready", "pid": os.getpid(), "calls": self.calls,
+        return {"status": "ready", "payload": "a" * 30000 if marker == "large_result" else "",
+                "pid": os.getpid(), "calls": self.calls,
                 "original_cursor": arguments.get("cursor"), "operation": operation}
 
     def revalidate_result_iter(self, operation, arguments, result):
+        if arguments.get("thread_id") == "completed_validation_stages":
+            self._configuration()
+            self._metadata()
+            self._derive()
         if arguments.get("thread_id") == "unstable_validation" and result["calls"] == 1:
             time.sleep(0.04)
             yield None
@@ -151,6 +181,94 @@ class HistoryProcessTests(unittest.TestCase):
         result = facade.read_codex_thread("slow", cursor=response["next_cursor"])
         self.assertEqual(result["status"], "restart_required")
         self.finish(facade, {"thread_id": "normal"})
+
+    def test_completed_checks_are_progress_without_suspending_final_guard(self):
+        facade = self.facade(wait_seconds=1, step_seconds=0.15)
+        for marker in ("completed_stages", "completed_validation_stages"):
+            result = facade.read_codex_thread(marker)
+            self.assertEqual(result["status"], "ready")
+        self.assertFalse(any(e["event"] == "worker_stop" for e in facade.diagnostic_events()))
+
+    def test_completed_duplicate_deliveries_are_progress_with_same_watchdog(self):
+        self.policy.write_text('{"allowed":true,"slow_delivery":true,"slow_validation":true}')
+        facade = self.facade(wait_seconds=0.005, step_seconds=0.15)
+        first = facade.read_codex_thread("normal")
+        self.assertEqual(first["status"], "processing")
+        facade._wait_seconds = 2
+        args = {"thread_id": "normal", "cursor": first["next_cursor"]}
+        with ThreadPoolExecutor(max_workers=3) as pool:
+            replies = list(pool.map(lambda _: facade.read_codex_thread(**args), range(3)))
+        self.assertEqual([r["status"] for r in replies], ["ready"] * 3)
+        self.assertEqual(len({r["pid"] for r in replies}), 1)
+        self.assertFalse(any(e["event"] == "worker_stop" for e in facade.diagnostic_events()))
+
+    def test_fragmented_ready_response_is_drained_before_watchdog_decision(self):
+        facade = self.facade(wait_seconds=2, step_seconds=0.15)
+        class FragmentedReader:
+            def __init__(self, connection):
+                self.connection = connection
+            def recv(self, size):
+                return self.connection.recv(min(size, 1024))
+            def send(self, data):
+                return self.connection.send(data)
+            def close(self):
+                return self.connection.close()
+        with facade._lock:
+            facade._start()
+            facade._socket = FragmentedReader(facade._socket)
+        reply = facade.read_codex_thread("large_result")
+        self.assertEqual(reply["status"], "ready")
+        self.assertEqual(len(reply["payload"]), 30000)
+        self.assertFalse(any(e["event"] == "worker_stop" for e in facade.diagnostic_events()))
+
+    def test_blocked_single_delivery_still_times_out(self):
+        self.policy.write_text('{"allowed":true,"slow_delivery":true,"delivery_delay":1}')
+        facade = self.facade(wait_seconds=1, step_seconds=0.15)
+        reply = facade.read_codex_thread("normal")
+        self.assertEqual(reply["status"], "processing_timeout")
+        stop = next(e for e in facade.diagnostic_events() if e["event"] == "worker_stop")
+        self.assertEqual(stop["phase"], "delivery")
+
+    def test_single_blocked_stage_still_times_out_at_unchanged_budget(self):
+        facade = self.facade(wait_seconds=1, step_seconds=0.15)
+        result = facade.read_codex_thread("blocked_stage")
+        self.assertEqual(result["status"], "processing_timeout")
+        event = next(e for e in facade.diagnostic_events() if e["event"] == "worker_stop")
+        self.assertEqual(event["stage"], "_configuration")
+        self.assertEqual(event["stage_state"], "running")
+
+    def test_background_stop_reason_survives_without_waiters_and_is_private(self):
+        facade = self.facade(wait_seconds=0.005, step_seconds=0.15)
+        first = facade.read_codex_thread("hang")
+        self.assertEqual(first["status"], "processing")
+        deadline = time.monotonic() + 3
+        while facade._process is not None and time.monotonic() < deadline:
+            time.sleep(0.02)
+        self.assertIsNone(facade._process)
+        result = facade.read_codex_thread("hang", cursor=first["next_cursor"])
+        self.assertEqual(result["status"], "restart_required")
+        events = facade.diagnostic_events()
+        stop = next(e for e in events if e["event"] == "worker_stop")
+        self.assertEqual(stop["reason"], "step_timeout")
+        self.assertEqual(stop["waiters"], 0)
+        self.assertEqual(events[-1]["reason"], "step_timeout")
+        serialized = json.dumps(events)
+        for secret in ("hang", str(self.policy), first["next_cursor"], facade._generation):
+            self.assertNotIn(secret, serialized)
+        self.assertNotIn("restart_reason", result)
+        facade._wait_seconds = 1
+        self.finish(facade, {"thread_id": "normal"})
+
+    def test_diagnostic_sink_failure_cannot_break_reads_and_storage_is_bounded(self):
+        facade = self.facade(wait_seconds=1)
+        def failing_sink(event):
+            raise RuntimeError("private diagnostic sink error")
+        facade.set_diagnostic_sink(failing_sink)
+        self.finish(facade, {"thread_id": "normal"})
+        for _ in range(300):
+            facade._diagnose("worker_start")
+        self.assertEqual(len(facade.diagnostic_events()), 256)
+        self.assertNotIn("private", json.dumps(facade.diagnostic_events()))
 
     def test_inflight_equal_requests_merge_and_queue_is_bounded(self):
         facade = self.facade(wait_seconds=0.005)

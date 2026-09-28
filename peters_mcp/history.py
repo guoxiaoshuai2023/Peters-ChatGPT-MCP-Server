@@ -44,6 +44,18 @@ MAX_METADATA_BYTES = 8 * 1024 * 1024
 MAX_SNAPSHOTS = 8
 MAX_CACHE_BYTES = 128 * 1024 * 1024
 
+
+class _PreparedResult(dict):
+    """Public JSON fields with worker-local validation state tied to this result.
+
+    Dict serialization deliberately excludes the private slots. The task that
+    retains a page also retains its proof recipe; releasing the page releases
+    both, without a separate eviction budget invalidating a live response.
+    """
+
+    __slots__ = ('_validation_recipe', '_validation_owner')
+
+
 class HistoryAccess:
     """In-process engine. MCP entrypoints run its generators in IsolatedHistory."""
 
@@ -57,7 +69,7 @@ class HistoryAccess:
         self._lock = threading.Lock()
         self._verified = {}
         self._snapshots = {}
-        self._deliveries = {}
+        self._delivery_owner = object()
 
     def _configuration(self):
         if self.catalog is not None:
@@ -285,7 +297,7 @@ class HistoryAccess:
     def close(self):
         self._snapshots.clear()
         self._verified.clear()
-        self._deliveries.clear()
+        self._delivery_owner = object()
         self._find_cache.clear()
 
     @staticmethod
@@ -302,10 +314,10 @@ class HistoryAccess:
         return (yield from getattr(self, '_' + operation + '_iter')(**arguments))
 
     def revalidate_result_iter(self, operation, arguments, result):
-        recipe = self._deliveries.get(id(result))
-        if recipe is None:
+        if (not isinstance(result, _PreparedResult)
+                or result._validation_owner is not self._delivery_owner):
             raise AccessError('Prepared response expired; restart the read.', code='restart_required')
-        config, rows, snapshots = recipe
+        config, rows, snapshots = result._validation_recipe
         fresh = yield from self._revalidate_iter(config, rows, snapshots)
         if result.get('snapshot'):
             row = rows[result['thread']['thread_id']] if 'thread' in result else rows[result['thread_id']]
@@ -315,9 +327,9 @@ class HistoryAccess:
         return result
 
     def _remember(self, result, config, rows, snapshots=None):
-        if len(self._deliveries) >= 16:
-            self._deliveries.pop(next(iter(self._deliveries)))
-        self._deliveries[id(result)] = (config, rows, snapshots or {})
+        result = _PreparedResult(result)
+        result._validation_owner = self._delivery_owner
+        result._validation_recipe = (config, rows, snapshots or {})
         result['status'] = 'ready'
         result['projection_version'] = PROJECTION_VERSION
         result['validated_at'] = utc(time.time())
@@ -456,6 +468,23 @@ class HistoryAccess:
             if stamp(os.fstat(fd)) != current['stamp']:
                 raise AccessError('Source changed during verification; wait for stability.', code='waiting_source_stable')
         current.update(path=row['rollout_path'], created=now, prefixes={expected['id']} if expected else set())
+        if (previous and previous['path'] == current['path']
+                and previous['stamp'] == current['stamp']
+                and previous['bytes'] == current['bytes']
+                and previous['sha256'] == current['sha256']):
+            # Rechecking another frozen prefix of the exact same current source
+            # must not discard an already verified current projection. Never
+            # transfer this evidence across an append, rewrite or replacement.
+            current['prefixes'].update(
+                key for key in previous['prefixes']
+                if key in self._snapshots and self._snapshots[key]['row_id'] == row['id'])
+            key = previous.get('snapshot_id')
+            cached = self._snapshots.get(key)
+            if (cached and cached['row_id'] == row['id']
+                    and cached['snapshot']['bytes'] == current['bytes']
+                    and cached['snapshot']['sha256'] == current['sha256']):
+                current['snapshot_id'] = key
+                current['tool_refs'] = previous.get('tool_refs', False)
         # Do not keep raw/tool payloads or unlimited per-source versions in memory.
         self._verified[row['id']] = current
         if len(self._verified)>MAX_CANDIDATES:

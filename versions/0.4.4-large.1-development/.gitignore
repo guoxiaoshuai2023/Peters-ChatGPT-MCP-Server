@@ -1,0 +1,33 @@
+.venv/
+__pycache__/
+*.pyc
+.DS_Store
+work/
+deployment/*.local.json
+deployment/*.token
+tools/cloudflared
+deployment/test-project/candidates/chatgpt/*.md
+
+# Machine-specific authorization and deployment state; commit examples only.
+/projects.json
+/history-access.json
+/delivery-access.json
+/deployment/projects-test.json
+*.local.json
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+*.token
+*.bundle
+
+# Test state and actual original-file policies stay local; examples remain portable.
+lab/
+runtime/
+private/
+evidence/
+original-files.json
+original-exports.json

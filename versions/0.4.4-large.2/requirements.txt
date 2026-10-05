@@ -1,0 +1,2 @@
+# The official MCP SDK; all transitive versions are captured in requirements.lock.
+mcp==2.2.0

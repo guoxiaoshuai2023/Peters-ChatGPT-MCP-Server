@@ -1,0 +1,8 @@
+{
+  "version": 1,
+  "enabled": false,
+  "spool_root": "/absolute/path/to/registered-private-spool",
+  "profile_id": "chatgpt-web-gpt56sol-high-mcp-resource-20261003-v1",
+  "max_file_bytes": 12659780,
+  "min_free_bytes": 1073741824
+}

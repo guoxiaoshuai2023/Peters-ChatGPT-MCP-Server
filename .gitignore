@@ -3,6 +3,7 @@ __pycache__/
 *.pyc
 .DS_Store
 work/
+/acceptance/
 deployment/*.local.json
 deployment/*.token
 tools/cloudflared

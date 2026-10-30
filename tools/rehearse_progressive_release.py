@@ -28,6 +28,41 @@ REPO = Path(__file__).resolve().parent.parent
 PROTOCOL = '2026-07-28'
 TOOLS = {'prepare_chunked_export', 'get_chunked_export_status', 'get_chunked_export_plan',
          'materialize_chunked_export_part', 'materialize_chunked_export_receiver', 'cancel_chunked_export'}
+DEFAULT_TIER_BYTES = 30_000_000
+PART_MAX_BYTES = 8_000_000
+
+
+def tier_byte_count(value):
+    if isinstance(value, str):
+        try:
+            value = int(value)
+        except ValueError:
+            raise argparse.ArgumentTypeError('tier bytes must be an integer') from None
+    if type(value) is not int or not 8192 <= value <= 100_000_000:
+        raise argparse.ArgumentTypeError('tier bytes must be between 8192 and 100000000')
+    return value
+
+
+def child_environment(profile=None, parent=None):
+    profile = 'inherit' if profile is None else profile
+    if profile not in ('inherit', 'system-default'):
+        raise ValueError('invalid_allocator_profile')
+    environment = dict(os.environ if parent is None else parent)
+    if profile == 'system-default':
+        environment.pop('MallocNanoZone', None)
+    return environment
+
+
+def rss_extra_limit(profile=None, tier_bytes=30_000_000, allocator_profile='inherit'):
+    profile = '128m' if profile is None else profile
+    if profile == '128m':
+        return 128 * 1024 * 1024
+    if profile != 'capacity100-256m':
+        raise ValueError('invalid_rss_profile')
+    if (type(tier_bytes) is not int or tier_bytes != 100_000_000
+            or allocator_profile != 'system-default'):
+        raise ValueError('rss_profile_requires_capacity100_system_default')
+    return 256 * 1024 * 1024
 
 
 def stable_source(path, maximum=100_000_000):
@@ -345,7 +380,8 @@ def serve(args):
         if instance.started:
             # Synthetic, ephemeral JWT only. Never copied into the report.
             save_new(args.ready_file, {'port': sock.getsockname()[1], 'token': tokens(), 'pid': os.getpid(),
-                                      'rss_native_before': resource.getrusage(resource.RUSAGE_SELF).ru_maxrss})
+                                      'rss_native_before': resource.getrusage(resource.RUSAGE_SELF).ru_maxrss,
+                                      'memory_environment': {'MallocNanoZone': os.environ.get('MallocNanoZone')}})
             args.ready_file.chmod(0o600)
             stop_file = args.ready_file.with_suffix('.stop')
             measure_file = args.ready_file.with_suffix('.measure')
@@ -358,7 +394,8 @@ def serve(args):
                         'observed_at_unix': time.time(), 'observed_monotonic': time.monotonic(),
                         'platform': sys.platform,
                         'native_maxrss': resource.getrusage(resource.RUSAGE_SELF).ru_maxrss,
-                        'native_maxrss_unit': 'bytes' if sys.platform == 'darwin' else 'KiB'})
+                        'native_maxrss_unit': 'bytes' if sys.platform == 'darwin' else 'KiB',
+                        'memory_environment': {'MallocNanoZone': os.environ.get('MallocNanoZone')}})
                 if stop_file.exists() and json.loads(stop_file.read_bytes()) == {'pid': os.getpid()}:
                     instance.should_exit = True
                     return
@@ -475,7 +512,9 @@ class ResidentSampler:
                 'sample_count': len(samples), 'errors': list(self.errors),
                 'maximum_observed_gap_seconds': max(gaps) if gaps else None}
 
-    def validate(self, started, ended, baseline):
+    def validate(self, started, ended, baseline, extra_limit_bytes=128 * 1024 * 1024):
+        if type(extra_limit_bytes) is not int or extra_limit_bytes not in (128 * 1024 * 1024, 256 * 1024 * 1024):
+            raise RuntimeError('rss_extra_limit_invalid')
         evidence = self.evidence(started, ended)
         samples = evidence['samples']
         inside = [x for x in samples if started <= x['started_monotonic'] <= ended]
@@ -488,24 +527,28 @@ class ResidentSampler:
             raise RuntimeError('rss_measurement_incomplete')
         peak = max(x['rss_bytes'] for x in samples)
         extra = max(0, peak - baseline)
-        if extra > 128 * 1024 * 1024:
+        if extra > extra_limit_bytes:
             raise RuntimeError('rss_sampled_extra_limit_exceeded')
         return {'baseline_bytes': baseline, 'peak_bytes': peak, 'extra_bytes': extra,
+                'maximum_allowed_extra_bytes': extra_limit_bytes,
                 'valid_samples_during_transfer': len(inside), 'evidence': evidence}
 
 
-def native_highwater_bound(baseline_bytes, before_bytes, after_bytes):
+def native_highwater_bound(baseline_bytes, before_bytes, after_bytes, extra_limit_bytes=128 * 1024 * 1024):
+    if type(extra_limit_bytes) is not int or extra_limit_bytes not in (128 * 1024 * 1024, 256 * 1024 * 1024):
+        raise RuntimeError('rss_extra_limit_invalid')
     if any(type(x) is not int or x <= 0 for x in (baseline_bytes, before_bytes, after_bytes)):
         raise RuntimeError('native_highwater_measurement_invalid')
     if after_bytes < before_bytes:
         raise RuntimeError('native_highwater_moved_backwards')
     upper = max(0, after_bytes - baseline_bytes)
-    if upper > 128 * 1024 * 1024:
+    if upper > extra_limit_bytes:
         raise RuntimeError('native_highwater_above_current_baseline_limit_exceeded')
     return {'current_resident_baseline_bytes': baseline_bytes,
             'native_highwater_before_bytes': before_bytes, 'native_highwater_after_bytes': after_bytes,
             'historical_highwater_delta_bytes_diagnostic_only': max(0, after_bytes - before_bytes),
             'conservative_lifetime_peak_above_current_baseline_bytes': upper,
+            'maximum_allowed_extra_bytes': extra_limit_bytes,
             'not_a_substitute_for_valid_timed_samples': True}
 
 
@@ -521,9 +564,30 @@ def database_metadata(root):
 
 
 def exercise(args):
+    selected_tier = getattr(args, 'tier_bytes', None)
+    tier_bytes = tier_byte_count(DEFAULT_TIER_BYTES if selected_tier is None else selected_tier)
+    part_count = (tier_bytes + PART_MAX_BYTES - 1) // PART_MAX_BYTES
+    source_name = ('source-30mb.zip' if tier_bytes == DEFAULT_TIER_BYTES
+                   else 'source-' + str(tier_bytes) + '-bytes.zip')
+    selected_profile = getattr(args, 'allocator_profile', None)
+    allocator_profile = 'inherit' if selected_profile is None else selected_profile
+    selected_rss_profile = getattr(args, 'rss_profile', None)
+    rss_profile = '128m' if selected_rss_profile is None else selected_rss_profile
+    extra_limit_bytes = rss_extra_limit(rss_profile, tier_bytes, allocator_profile)
+    environment = child_environment(allocator_profile)
+    parent_memory = {'MallocNanoZone': os.environ.get('MallocNanoZone')}
+    selected_memory = {'MallocNanoZone': environment.get('MallocNanoZone')}
     ref = load_reference()
     report = {'kind': 'isolated_authenticated_loopback_sdk_only', 'native_chatgpt_acceptance': False,
-              'source': str(args.source), 'phases': [],
+              'source': str(args.source), 'tier_bytes': tier_bytes, 'phases': [],
+              'rss_profile': rss_profile, 'rss_extra_limit_bytes': extra_limit_bytes,
+              'allocator_environment': {
+                  'requested_profile': allocator_profile,
+                  'parent_memory_environment': parent_memory,
+                  'selected_child_memory_environment': selected_memory,
+                  'environment_changes': [{'name': 'MallocNanoZone', 'before': parent_memory['MallocNanoZone'],
+                                           'after': selected_memory['MallocNanoZone']}]
+                                         if parent_memory != selected_memory else []},
               'independent_receiver': receiver_pin(args.source)}
     loader_path = args.loader or args.source / 'tools/native_receiver_loader.py'
     loader, loader_record = reviewed_loader(args.source, loader_path, args.expected_loader_sha256)
@@ -532,13 +596,13 @@ def exercise(args):
         fixture = root / 'fixture'
         fixture.mkdir()
         ref.fixture(fixture)
-        policy = {'version': 1, 'enabled': True, 'max_file_bytes': 30_000_000,
+        policy = {'version': 1, 'enabled': True, 'max_file_bytes': tier_bytes,
                   'min_free_bytes': 1_073_741_824, 'protocol_version': 'raw-parts-v1'}
         save_new(fixture / 'chunked-config.json', policy)
         (fixture / 'chunked-config.json').chmod(0o600)
         fixture_builder = args.fixture_builder or args.source / 'tools/generate_progressive_fixture.py'
         generator, generator_record = source_module(fixture_builder, 'fixed_fixture_generator')
-        generated = [generator.make_zip(fixture / 'repo/source-30mb.zip', 30_000_000),
+        generated = [generator.make_zip(fixture / 'repo' / source_name, tier_bytes),
                      generator.make_zip(fixture / 'repo/small.zip', 8192)]
         measured_sources = {Path(item['path']).name: source_record(item['path']) for item in generated}
         for item in generated:
@@ -557,11 +621,13 @@ def exercise(args):
             log_path = args.output.parent / (args.output.stem + '-' + phase + '.log')
             bundle_source = args.rollback_source if phase == 'rollback' and args.rollback_source else args.source
             command = [sys.executable, '-B', str(Path(__file__).resolve()), '--source', str(bundle_source),
-                       '--fixture-root', str(fixture), '--ready-file', str(ready)]
+                       '--fixture-root', str(fixture), '--ready-file', str(ready),
+                       '--allocator-profile', allocator_profile]
             if phase == 'rollback':
                 command.append('--inspection-only')
             with log_path.open('xb') as log:
-                child = subprocess.Popen(command, stdout=log, stderr=subprocess.STDOUT, cwd=args.source)
+                child = subprocess.Popen(command, stdout=log, stderr=subprocess.STDOUT, cwd=args.source,
+                                         env=environment)
                 owned_pid = child.pid
                 http = None
                 sampler = None
@@ -571,6 +637,7 @@ def exercise(args):
                 rss_evidence_path = args.output.with_name(args.output.stem + '-' + phase + '-rss.json')
                 try:
                     state = wait_ready(ready, child)
+                    assert state['pid'] == child.pid and state['memory_environment'] == selected_memory
                     http = ref.HTTP(state['port'], state['token'])
                     assert http.rpc('tools/list', token='').status_code == 401
                     listing = http.rpc('tools/list').json()['result']['tools']
@@ -581,6 +648,9 @@ def exercise(args):
                             'platform': sys.platform,
                             'native_maxrss_unit': 'bytes' if sys.platform == 'darwin' else 'KiB',
                             'native_maxrss_at_startup': state['rss_native_before'],
+                            'allocator_profile': allocator_profile,
+                            'rss_profile': rss_profile, 'rss_extra_limit_bytes': extra_limit_bytes,
+                            'memory_environment_at_startup': state['memory_environment'],
                             'unauthenticated_status': 401, 'baseline_rows': len(baseline)}
                     if phase == 'rollback':
                         assert not (TOOLS & names)
@@ -589,7 +659,7 @@ def exercise(args):
                     else:
                         assert TOOLS <= names
                         assert projects['original_export']['max_original_bytes'] == 12_659_780
-                        assert projects['chunked_export']['configured_max_file_bytes'] == 30_000_000
+                        assert projects['chunked_export']['configured_max_file_bytes'] == tier_bytes
                         window = projects['original_export']
                         common = {'project_id': 'repo', 'worktree_id': 'main',
                                   'service_instance_id': window['service_instance_id'],
@@ -613,6 +683,7 @@ def exercise(args):
                                 time.sleep(.01)
                             measured = json.loads(metrics_path.read_bytes())
                             assert measured['pid'] == child.pid and measured['phase'] == 'before_chunked'
+                            assert measured['memory_environment'] == selected_memory
                             step['server_native_maxrss_before_chunked'] = measured
                             current_baseline = current_resident_baseline(child.pid)
                             baseline_rss = current_baseline['baseline_bytes']
@@ -620,9 +691,9 @@ def exercise(args):
                             sampler = ResidentSampler(child.pid)
                             sampler.start()
                             transfer_started = time.monotonic()
-                            accepted = http.tool('prepare_chunked_export', {**common, 'path': 'source-30mb.zip',
+                            accepted = http.tool('prepare_chunked_export', {**common, 'path': source_name,
                                 'request_key': 'first-chunked',
-                                'expected_sha256': measured_sources['source-30mb.zip']['sha256']})
+                                'expected_sha256': measured_sources[source_name]['sha256']})
                             export_id = accepted['export_id']
                             sampler.check_health()
                             for _ in range(200):
@@ -634,8 +705,13 @@ def exercise(args):
                             planned = http.tool('get_chunked_export_plan', {'export_id': export_id})
                             assert planned['state'] == 'ready' and planned['export_id'] == export_id
                             plan = planned['plan']
-                            assert plan['total_bytes'] == 30_000_000 and plan['part_count'] == 4
-                            assert plan['total_sha256'] == measured_sources['source-30mb.zip']['sha256']
+                            assert plan['total_bytes'] == tier_bytes and plan['part_count'] == part_count
+                            assert plan['part_max_bytes'] == PART_MAX_BYTES
+                            assert [(part['index'], part['offset'], part['bytes']) for part in plan['parts']] == [
+                                (index, index * PART_MAX_BYTES,
+                                 min(PART_MAX_BYTES, tier_bytes - index * PART_MAX_BYTES))
+                                for index in range(part_count)]
+                            assert plan['total_sha256'] == measured_sources[source_name]['sha256']
                             assert plan['receiver_asset'] == report['independent_receiver']['pin']
                             native = root / 'local-receiver'
                             native.mkdir(mode=0o700)
@@ -661,7 +737,7 @@ def exercise(args):
                                 assert len(body) == part['bytes'] and hashlib.sha256(body).hexdigest() == part['sha256']
                                 receiver.ingest(part['index'], path)
                                 sampler.check_health()
-                                with (fixture / 'repo/source-30mb.zip').open('rb') as original:
+                                with (fixture / 'repo' / source_name).open('rb') as original:
                                     original.seek(part['offset'])
                                     assert original.read(part['bytes']) == body
                                 evidence.append({'index': part['index'], 'actual_path': str(path),
@@ -673,9 +749,9 @@ def exercise(args):
                                     receiver = module.NativeChunkReceiver.resume(receiver.session_path, plan, input_root=native)
                             finished = receiver.finish()
                             final = output / 'received.zip'
-                            assert final.stat().st_size == 30_000_000
+                            assert final.stat().st_size == tier_bytes
                             digest = hashlib.sha256(final.read_bytes()).hexdigest()
-                            assert digest == plan['total_sha256'] == measured_sources['source-30mb.zip']['sha256']
+                            assert digest == plan['total_sha256'] == measured_sources[source_name]['sha256']
                             with zipfile.ZipFile(final) as archive:
                                 assert archive.testzip() is None
                             cancelled = http.tool('cancel_chunked_export', {'export_id': export_id})
@@ -687,7 +763,8 @@ def exercise(args):
                             assert cancelled['resources_released'] is True
                             transfer_ended = time.monotonic()
                             sampler.stop()
-                            timed_rss = sampler.validate(transfer_started, transfer_ended, baseline_rss)
+                            timed_rss = sampler.validate(transfer_started, transfer_ended, baseline_rss,
+                                                         extra_limit_bytes=extra_limit_bytes)
                             step.update(plan_sha256=plan['plan_sha256'], parts=evidence,
                                         whole_sha256=digest, final_status=finished,
                                         same_plan_duplicate_and_resume=True, resources_released=True,
@@ -719,7 +796,7 @@ def exercise(args):
                     report['phases'][-1]['server_native_maxrss_delta_bytes'] = max(0, closed['rss_native_after'] * multiplier - before)
                     report['phases'][-1]['native_highwater_resource_bound'] = native_highwater_bound(
                         report['phases'][-1]['server_rss_baseline_bytes'], before,
-                        closed['rss_native_after'] * multiplier)
+                        closed['rss_native_after'] * multiplier, extra_limit_bytes=extra_limit_bytes)
         report['result'] = 'PASS'
         save_new(args.output, report)
     print(json.dumps({'result': report['result'], 'report': str(args.output),
@@ -729,6 +806,12 @@ def exercise(args):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--source', type=Path, required=True)
+    parser.add_argument('--tier-bytes', type=tier_byte_count, default=DEFAULT_TIER_BYTES,
+                        help='Exact synthetic transfer size, 8192..100000000 bytes (default: 30000000).')
+    parser.add_argument('--allocator-profile', choices=('inherit', 'system-default'), default='inherit',
+                        help='Child environment only: inherit, or unset MallocNanoZone before process startup.')
+    parser.add_argument('--rss-profile', choices=('128m', 'capacity100-256m'), default='128m',
+                        help='Extra RSS limit; capacity100-256m requires exact 100 MB and system-default allocator.')
     parser.add_argument('--fixture-builder', type=Path,
                         help='Explicit synthetic fixture generator when testing a frozen runtime package.')
     parser.add_argument('--rollback-source', type=Path,
@@ -742,6 +825,10 @@ def main():
     parser.add_argument('--ready-file', type=Path)
     parser.add_argument('--inspection-only', action='store_true')
     args = parser.parse_args()
+    try:
+        rss_extra_limit(args.rss_profile, args.tier_bytes, args.allocator_profile)
+    except ValueError as error:
+        parser.error(str(error))
     args.source = args.source.resolve()
     if args.rollback_source is not None:
         args.rollback_source = args.rollback_source.resolve()

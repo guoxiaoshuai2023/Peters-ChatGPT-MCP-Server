@@ -1,0 +1,7 @@
+{
+  "version": 1,
+  "enabled": false,
+  "max_file_bytes": 30000000,
+  "min_free_bytes": 1073741824,
+  "protocol_version": "raw-parts-v1"
+}

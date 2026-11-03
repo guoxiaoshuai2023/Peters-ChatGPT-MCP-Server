@@ -1,0 +1,6 @@
+{
+  "team_domain": "https://your-team.cloudflareaccess.com",
+  "audience": "REPLACE_WITH_YOUR_64_CHARACTER_APPLICATION_AUDIENCE_TAG",
+  "public_hostname": "mcp.example.com",
+  "allowed_emails": ["you@example.com"]
+}

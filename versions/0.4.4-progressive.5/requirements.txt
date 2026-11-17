@@ -1,0 +1,3 @@
+# MCP SDK and compressed-history support; complete versions in requirements.lock.
+mcp==2.2.0
+backports.zstd==1.8.0; python_version < '3.14'

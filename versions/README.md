@@ -1,5 +1,7 @@
 # 独立发布源码快照
 
+多 Agent 历史候选版 [`0.4.4-progressive.5`](0.4.4-progressive.5/AGENT_HISTORY.md) 以冻结 `.4` 为基线。它增加 Codeg、DeepSeek Harness 和 Antigravity 的只读会话工具及单独授权配置。候选构建清单见 [BUILD_SPEC](0.4.4-progressive.5/BUILD_SPEC.json)。真实应用历史与 ChatGPT 连接器的对照验收尚待执行。
+
 最新项目会话修复快照为 [`0.4.4-progressive.4`](0.4.4-progressive.4/README.md)，由冻结 `.3` 派生。`inherit_projects=true` 覆盖所有已配置目录项目及身份校验通过的仓库项目，现有／未来线程无需单独授权；目录项目覆盖真实子树，仓库项目覆盖有效登记 worktree。每条线程的索引 cwd、全部记录 cwd 和 fork 身份仍须通过验证，撤权及目录身份变化使旧游标失效。默认配置不开放历史，迁移时逐一核对项目范围并移除已由项目继承覆盖的冗余显式线程例外。
 
 `public-jsonl-stream-v4` 支持分块读取 `.jsonl.zst`，兼容索引仍指向未压缩旧路径；12–64 MiB 记录完整校验 JSON 并只保留归属／轮次字段。缺失、损坏和资源限制明确报错或标记覆盖不足。已公开异步消息保留原位，注入的 harness／AGENTS 用户块继续过滤。工具证据独立授权，搜索 `limit` 在 MCP schema 中限制为 1–20。

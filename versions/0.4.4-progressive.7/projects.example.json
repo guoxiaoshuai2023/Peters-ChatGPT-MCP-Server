@@ -1,0 +1,10 @@
+{
+  "projects": [
+    {
+      "id": "my-project",
+      "name": "My Project",
+      "root": "/absolute/path/to/your/project",
+      "exclude": ["private", "docs/internal/*"]
+    }
+  ]
+}

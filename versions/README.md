@@ -1,5 +1,7 @@
 # 独立发布源码快照
 
+Antigravity 步骤缺口修复快照为 [`0.4.4-progressive.7`](0.4.4-progressive.7/AGENT_HISTORY.md)。完整日志与精简日志的现存步骤逐条对应且缺口相同，仍恢复已验证的公开正文并标记覆盖不完整。构建清单见 [BUILD_SPEC](0.4.4-progressive.7/BUILD_SPEC.json)。
+
 Antigravity 完整回复修复快照为 [`0.4.4-progressive.6`](0.4.4-progressive.6/AGENT_HISTORY.md)。它在核对同线程精简日志与完整日志后恢复截断的可见正文，继续使用逐线程授权和既有过滤。构建清单见 [BUILD_SPEC](0.4.4-progressive.6/BUILD_SPEC.json)。
 
 多 Agent 历史候选版 [`0.4.4-progressive.5`](0.4.4-progressive.5/AGENT_HISTORY.md) 以冻结 `.4` 为基线。它增加 Codeg、DeepSeek Harness 和 Antigravity 的只读会话工具及单独授权配置。候选构建清单见 [BUILD_SPEC](0.4.4-progressive.5/BUILD_SPEC.json)。真实应用历史与 ChatGPT 连接器的对照验收尚待执行。

@@ -1,5 +1,12 @@
 # 独立发布源码快照
 
+Antigravity 版本兼容修复快照为 [`0.4.4-progressive.8`](0.4.4-progressive.8/AGENT_HISTORY.md)。Antigravity 来源可以省略 `format`，读取器校验 v3 会话索引、原生日志结构与消息来源，按现有账号、项目和逐线程授权读取。显式配置 `2.32.1` 和 `2.33.0` 仍可用。按[构建清单](0.4.4-progressive.8/BUILD_SPEC.json)可复构以下发布包。
+
+| progressive.8 固定包 | SHA-256 |
+| --- | --- |
+| candidate | `e452737fd9788ce605bab542837b5aa9df410d58698e2aa75c9ee182ccf170c2` |
+| inspection rollback | `7782089432dc782717c58b53477d954344aaa8d6fe2a69fe6d5b4c6e9df99962` |
+
 Antigravity 步骤缺口修复快照为 [`0.4.4-progressive.7`](0.4.4-progressive.7/AGENT_HISTORY.md)。完整日志与精简日志的现存步骤逐条对应且缺口相同，仍恢复已验证的公开正文并标记覆盖不完整。构建清单见 [BUILD_SPEC](0.4.4-progressive.7/BUILD_SPEC.json)。
 
 Antigravity 完整回复修复快照为 [`0.4.4-progressive.6`](0.4.4-progressive.6/AGENT_HISTORY.md)。它在核对同线程精简日志与完整日志后恢复截断的可见正文，继续使用逐线程授权和既有过滤。构建清单见 [BUILD_SPEC](0.4.4-progressive.6/BUILD_SPEC.json)。

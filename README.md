@@ -2,6 +2,8 @@
 
 [MIT License](LICENSE)
 
+**Antigravity 版本兼容修复：[`0.4.4-progressive.8`](versions/0.4.4-progressive.8/AGENT_HISTORY.md)**。配置 Antigravity 会话读取时可以省略应用版本号。读取器继续校验本地索引、日志结构和逐线程授权。发布包指纹见[发布索引](versions/README.md)。
+
 **项目会话继承修复：[`0.4.4-progressive.4`](versions/0.4.4-progressive.4/README.md)**。启用项目继承后，已授权目录及仓库的现有和新建 Codex 线程自动获得公开文字读取权限；无需逐线程登记。另修复压缩历史、含大型附件的记录校验和公开消息兼容。版本、构建指纹、测试及各机器部署状态见[发布索引](versions/README.md)。部署这次修复请使用该快照及其 `BUILD_SPEC.json`；根目录 `0.6.0` 是独立开发线，旧快照保持冻结，不以根目录开发功能替换生产运行包。
 
 基线 [`0.4.4-progressive.3`](versions/README.md) 修复分片父任务在 macOS 睡眠后的到期计时，完成 70 项定向检查、100 MB 认证 SDK 演练及 8 KiB 原生收件验收。本次 `.4` 沿用其文件／导出实现；这些历史结果不替代新包或另一台机器的实际运行验收。

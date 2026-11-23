@@ -1,6 +1,6 @@
 # 独立发布源码快照
 
-[`0.4.4-progressive.11`](0.4.4-progressive.11/AGENT_HISTORY.md) 从冻结的 .9 派生，开发中。它将项目白名单用于现有项目级文件和会话工具。同一 ChatGPT 连接沿用已验证的身份。正式启用仍需取得 Antigravity 自动归属证据并完成 ChatGPT 实机验收。
+[`0.4.4-progressive.11`](0.4.4-progressive.11/AGENT_HISTORY.md) 从冻结的 .9 派生。同一 ChatGPT 连接使用一份项目白名单获得已启用的文件能力和经核实的多来源会话。隔离源站已读回六个项目中四种真实来源的会话，包括 Antigravity Desktop 2.33.0 自动归属的记录。正式启用仍需通过真实 ChatGPT 连接的查读与原生文件交付验收。[候选构建清单](0.4.4-progressive.11/BUILD_SPEC.json)
 
 统一项目白名单的隔离候选为 [`0.4.4-progressive.9`](0.4.4-progressive.9/AGENT_HISTORY.md)。它预览迁移，统一各已启用来源的项目授权，并将旧 Codex 工具纳入同一授权检查。Antigravity 自动归属仍待验收。构建清单和固定包指纹见 [BUILD_SPEC](0.4.4-progressive.9/BUILD_SPEC.json)。
 

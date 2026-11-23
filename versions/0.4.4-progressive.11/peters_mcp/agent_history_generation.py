@@ -14,6 +14,7 @@ from types import MappingProxyType
 
 from .catalog import AccessError
 from .fs_identity import persistent_identity, validate_identity
+from .history_location import CHECKPOINT_SECONDS, LocationWitnesses, merge_windows, owner_key
 
 MAX_GENERATION_BYTES = 512 * 1024
 MAX_POINTER_BYTES = 64 * 1024
@@ -141,16 +142,63 @@ def _acquire(fd, action, deadline):
 class GenerationSnapshot(tuple):
     """Preserve the document/digest interface while carrying persisted project grants."""
 
-    def __new__(cls, document, digest, project_tokens, project_identities, retained_sources):
+    def __new__(cls, document, digest, project_tokens, project_identities, retained_sources, root_history):
         snapshot = super().__new__(cls, (document, digest))
         snapshot.project_tokens = MappingProxyType(project_tokens)
         snapshot.project_identities = MappingProxyType(project_identities)
         snapshot.retained_sources = tuple(retained_sources)
+        snapshot.root_history = MappingProxyType({key: tuple(tuple(window) for window in value)
+                                                  for key, value in root_history.items()})
         return snapshot
 
     def __reduce__(self):
         return type(self), (self[0], self[1], dict(self.project_tokens), dict(self.project_identities),
-                            self.retained_sources)
+                            self.retained_sources, dict(self.root_history))
+
+
+def _root_history(previous, projects, identities, witnesses, worktrees):
+    # Keep closed occupation intervals for each physical project even when
+    # its name is subsequently granted to a different directory or project ID.
+    history = dict(previous)
+    locations = [(row["root"], row.get("repository_id"), identities[row["id"]]) for row in projects]
+    for root, repository, identity in (*locations, *worktrees):
+        key = owner_key(root, identity, repository)
+        try:
+            windows = witnesses.observe(root, identity["birthtime_ns"], identity)
+        except AccessError:
+            continue
+        combined = merge_windows((*history.get(key, ()), *windows))
+        if combined:
+            history[key] = combined
+    return history
+
+
+def _registered_checkouts(project):
+    from .catalog import Catalog
+
+    if project.get("repository_id"):
+        registry = Catalog._from_document({"projects": [project]}, unified=True).repositories
+        for entry in registry.discover(project["id"])["worktrees"]:
+            if entry["state"] == "valid" and not entry["is_default"]:
+                yield entry["root"]
+
+
+def _valid_windows(windows):
+    return (isinstance(windows, list) and bool(windows)
+            and all(isinstance(w, list) and len(w) == 2 and all(type(v) is int for v in w)
+                    and 0 < w[0] <= w[1] < 2 ** 63 for w in windows)
+            and tuple(map(tuple, windows)) == merge_windows(windows))
+
+
+def _covers(windows, span):
+    start, end = span
+    return any(lo <= start <= end <= hi for lo, hi in windows)
+
+
+def _recent_extension(saved, retained):
+    return (len(saved) == len(retained) and bool(saved) and saved[:-1] == retained[:-1]
+            and saved[-1][0] == retained[-1][0]
+            and 0 <= retained[-1][1] - saved[-1][1] < CHECKPOINT_SECONDS * 1_000_000_000)
 
 
 def _project_key(project):
@@ -179,6 +227,7 @@ class GenerationStore:
 
     def __init__(self, path):
         self.path = Path(path)
+        self.locations = LocationWitnesses()
         self.anchor_path = self.path.with_name("." + self.path.name + ".authorization-anchor.json")
         try:
             parent = _directory(self.path.parent)
@@ -210,8 +259,8 @@ class GenerationStore:
     def _decode(self, directory, pointer_raw):
         pointer = json.loads(pointer_raw, object_pairs_hook=_unique)
         if (not isinstance(pointer, dict)
-                or set(pointer) != {"version", "sha256", "activation_id", "project_tokens",
-                                    "project_identities", "retained_sources"}
+                or set(pointer) - {"root_history"} != {"version", "sha256", "activation_id", "project_tokens",
+                                                       "project_identities", "retained_sources"}
                 or type(pointer["version"]) is not int or pointer["version"] != 2
                 or not isinstance(pointer["sha256"], str) or not _DIGEST.fullmatch(pointer["sha256"])
                 or not isinstance(pointer["activation_id"], str)
@@ -258,8 +307,125 @@ class GenerationStore:
         if any(row.get("directory_identity") is not None
                and row["directory_identity"] != pointer["project_identities"][row["id"]] for row in projects):
             raise _invalid()
+        identities = pointer["project_identities"]
+        # Earlier v2 pointers stored no attested historical intervals.
+        roots = pointer.get("root_history", {})
+        if not isinstance(roots, dict):
+            raise _invalid()
+        for key, windows in roots.items():
+            if not _DIGEST.fullmatch(key) or not _valid_windows(windows):
+                raise _invalid()
         return GenerationSnapshot(document, hashlib.sha256(pointer_raw).hexdigest(),
-                                  pointer["project_tokens"], pointer["project_identities"], retained)
+                                  pointer["project_tokens"], identities, retained, roots)
+
+    def retained_location_windows(self, key, windows, *, span=None, deadline=None):
+        """Keep confirmed occupancy independently of the current source query.
+
+        An interval records a physical location fact. It cannot grant a project,
+        source or thread. Different locations have independent locks and budgets.
+        """
+        if not _DIGEST.fullmatch(key):
+            raise _invalid()
+        directory = _directory(self.path)
+        try:
+            info = os.fstat(directory)
+            if (info.st_dev, info.st_ino) != self.identity:
+                raise _invalid()
+            claim = ".project-occupancy-" + key
+            try:
+                os.mkdir(claim, 0o700, dir_fd=directory)
+            except FileExistsError:
+                pass
+            slot = os.open(claim, _DIRECTORY, dir_fd=directory)
+            try:
+                info = os.fstat(slot)
+                if info.st_uid != os.getuid() or stat.S_IMODE(info.st_mode) != 0o700:
+                    raise _invalid()
+                limit = time.monotonic() + 0.5
+                _acquire(slot, fcntl.LOCK_EX, min(deadline, limit) if deadline is not None else limit)
+                try:
+                    record = json.loads(_read_at(slot, "observed.json", 16384), object_pairs_hook=_unique)
+                    if isinstance(record, list):
+                        # Earlier development caches lacked their own physical
+                        # owner key. Re-establish intervals from current facts.
+                        saved = []
+                    elif (not isinstance(record, dict) or set(record) != {"version", "owner", "windows"}
+                            or type(record["version"]) is not int or record["version"] != 1
+                            or record["owner"] != key or not _valid_windows(record["windows"])):
+                        raise _invalid()
+                    else:
+                        saved = record["windows"]
+                except FileNotFoundError:
+                    saved = []
+                except ValueError:
+                    raise _invalid() from None
+                saved = tuple(tuple(window) for window in saved)
+                retained = merge_windows((*saved, *windows))[-256:]
+                if retained and retained != saved:
+                    # Preserve newly admitted native times and disjoint observations
+                    # immediately. Coalesce opportunistic tail growth during a scan.
+                    if (span is None or not _recent_extension(saved, retained)
+                            or (_covers(retained, span) and not _covers(saved, span))):
+                        _replace(slot, "observed.json", canonical_bytes(
+                            {"version": 1, "owner": key, "windows": retained}))
+                return retained
+            finally:
+                os.close(slot)
+        finally:
+            os.close(directory)
+
+    def verified_location_span(self, key, windows, start, end):
+        span = (start, end)
+        return _covers(self.retained_location_windows(key, windows, span=span), span)
+
+    def checkpoint_locations(self, next_project, checkout_indexes, *, deadline, stop=None):
+        """Close a bounded round of project observations without opening an agent source."""
+        from .workspaces import discovery_deadline
+
+        def expired():
+            return time.monotonic() >= deadline or (stop is not None and stop.is_set())
+
+        snapshot = self.snapshot(deadline=deadline)
+        projects = snapshot[0]["projects"]
+        if not projects:
+            checkout_indexes.clear()
+            return 0
+        current_ids = {project["id"] for project in projects}
+        for old in checkout_indexes.keys() - current_ids:
+            del checkout_indexes[old]
+        next_project %= len(projects)
+        for _ in range(min(len(projects), 16)):
+            if expired():
+                break
+            project = projects[next_project]
+            next_project = (next_project + 1) % len(projects)
+            pin = project.get("repository_id")
+            root = project["root"]
+            identity = snapshot.project_identities[project["id"]]
+            try:
+                self._checkpoint_location(root, identity, pin, deadline)
+                with discovery_deadline(min(deadline, time.monotonic() + 1.0)):
+                    checkouts = tuple(_registered_checkouts(project))
+            except (AccessError, OSError):
+                continue
+            if checkouts:
+                index = checkout_indexes.get(project["id"], 0) % len(checkouts)
+                for _ in range(min(len(checkouts), 8)):
+                    if expired():
+                        break
+                    checkout = checkouts[index]
+                    index = (index + 1) % len(checkouts)
+                    checkout_indexes[project["id"]] = index
+                    try:
+                        self._checkpoint_location(checkout, persistent_identity(checkout), pin, deadline)
+                    except (AccessError, OSError):
+                        continue
+        return next_project
+
+    def _checkpoint_location(self, root, identity, pin, deadline):
+        now = self.locations.observe(root, identity["birthtime_ns"], identity)
+        if time.monotonic() < deadline:
+            self.retained_location_windows(owner_key(root, identity, pin), now, deadline=deadline)
 
     def _load(self, directory):
         with self._parent() as parent:
@@ -332,8 +498,11 @@ class GenerationStore:
         if len(raw) > MAX_GENERATION_BYTES:
             raise _invalid()
         digest = hashlib.sha256(raw).hexdigest()
-        project_identities = {project["id"]: persistent_identity(Path(project["root"]))
-                              for project in document["projects"]}
+        # Discover external Git checkouts outside the activation lock. A
+        # saved interval is usable only for this physical checkout, pin and
+        # current native registration, which are rechecked on each read.
+        worktrees = [(checkout, row["repository_id"], persistent_identity(checkout))
+                     for row in document["projects"] for checkout in _registered_checkouts(row)]
         with self.locked(exclusive=True) as directory, self._parent() as parent:
             current = None
             if initial:
@@ -357,6 +526,10 @@ class GenerationStore:
                 os.fsync(generations)
             finally:
                 os.close(generations)
+            project_identities = {row["id"]: persistent_identity(Path(row["root"])) for row in document["projects"]}
+            if any(row.get("directory_identity") is not None and row["directory_identity"] != project_identities[row["id"]]
+                   for row in document["projects"]):
+                raise AccessError("Approved project, worktree or source evidence changed.", code="identity_mismatch")
             previous = {row["id"]: row for row in current[0]["projects"]} if current is not None else {}
             tokens = {}
             for row in document["projects"]:
@@ -368,7 +541,10 @@ class GenerationStore:
                                    else secrets.token_hex(16))
             pointer = canonical_bytes({"version": 2, "sha256": digest, "activation_id": secrets.token_hex(16),
                                        "project_tokens": tokens, "project_identities": project_identities,
-                                       "retained_sources": _retired_sources(current, document)})
+                                       "retained_sources": _retired_sources(current, document),
+                                       "root_history": _root_history(current.root_history if current else {},
+                                                                     document["projects"], project_identities,
+                                                                     self.locations, worktrees)})
             if len(pointer) > MAX_POINTER_BYTES:
                 raise _invalid()
             snapshot = self._decode(directory, pointer)

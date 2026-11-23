@@ -11,7 +11,7 @@ import unicodedata
 
 from .catalog import AccessError, AUTH_PATHS, BLOCKED_NAMES, BLOCKED_PATTERNS, DIRECTORY_FLAGS, _close_source_fd
 from .fs_identity import persistent_identity_fd
-from .project_guard import note_worktree
+from .project_guard import WorkspaceChanged, note_worktree, require_request_epoch, verify_committed_topology
 from .workspaces import _open_path, repository_probe, revalidate_repository_probe
 
 POLICY_VERSION = 'original-file-targets-v1'
@@ -56,9 +56,10 @@ class FileRootsProof:
     root: Path
     root_identity: tuple
     git: tuple
+    topology: object
 
     @classmethod
-    def capture(cls, project, root, root_identity):
+    def capture(cls, project, root, root_identity, topology):
         expected = project.directory_identity or project.registration_identity
         if expected is None:
             raise ValueError('configured project identity is required')
@@ -69,11 +70,12 @@ class FileRootsProof:
                 if probe['root'] != registered or probe['repository_id'] != project.repository_id:
                     raise ValueError('repository registration changed')
                 probes.append(probe)
-        proof = cls(project.root, expected, root, root_identity, tuple(probes))
+        proof = cls(project.root, expected, root, root_identity, tuple(probes), topology)
         proof.verify()
         return proof
 
     def verify(self):
+        verify_committed_topology()
         # Bounded metadata reads with no Git subprocesses or content access.
         # Acquire and release the FD set in this invocation, on its own thread.
         with ExitStack() as stack:
@@ -86,6 +88,22 @@ class FileRootsProof:
                 raise ValueError('working directory identity changed')
             for probe in self.git:
                 revalidate_repository_probe(probe)
+
+
+@dataclass(frozen=True)
+class PublicationProof:
+    roots: FileRootsProof
+    verify_path: object
+
+    def __call__(self):
+        try:
+            self.roots.verify()
+        except WorkspaceChanged:
+            raise
+        except (AccessError, OSError, ValueError, TypeError):
+            raise TargetError('scope_identity_changed', 'Target identity changed before publication.',
+                              permanent=True) from None
+        self.verify_path()
 
 
 class TargetError(AccessError):
@@ -221,9 +239,9 @@ class FileTargets:
             raise TargetError('special_path_requires_exception', 'This exact rules or automation path requires an explicit exception.', permanent=True)
         return _digest({'policy': POLICY_VERSION, 'special': bool(special), 'exception': bool(special and exception)})
 
-    def _target(self, project_id, worktree_id, path):
+    def _target(self, project_id, worktree_id, path, selection=None):
         parts = self._parts(path)
-        project, member, _ = self._member(project_id, worktree_id)
+        project, member, _ = selection if selection is not None else self._member(project_id, worktree_id)
         root = Path(member['root'])
         policy = self._policy(project, worktree_id, root, parts)
         identity = tuple(member['root_identity'])
@@ -249,8 +267,8 @@ class FileTargets:
             pass
         return target
 
-    def revalidate(self, target):
-        current = self._target(target.project_id, target.worktree_id, target.path)
+    def revalidate(self, target, *, selection=None):
+        current = self._target(target.project_id, target.worktree_id, target.path, selection)
         if current != target:
             raise TargetError('scope_identity_changed', 'Frozen target identity or policy changed.', permanent=True)
         self._check_existing_parents(current)
@@ -260,30 +278,25 @@ class FileTargets:
         """Take full membership evidence before the policy commit reservation."""
         if self.catalog.unified_policy is None:
             return None
-        self.revalidate(target)
-        project = self.catalog.projects.get(target.project_id)
-        if project is None:
-            raise TargetError('scope_revoked', 'Project is not authorized.', permanent=True)
+        project, member, discovery = self._member(target.project_id, target.worktree_id)
         root = Path(target.root)
+        if (str(root) != member['root'] or target.root_identity != tuple(member['root_identity'])
+                or target.repository_id != member['repository_id']):
+            raise TargetError('scope_identity_changed', 'Target no longer matches its verified scope.', permanent=True)
         parts = self._parts(target.path)
         try:
-            proof = FileRootsProof.capture(project, root, target.root_identity)
+            proof = FileRootsProof.capture(project, root, target.root_identity, discovery.topology)
         except (AccessError, OSError, ValueError, TypeError):
             raise TargetError('scope_identity_changed', 'Target identity cannot be verified.',
                               permanent=True) from None
 
-        def verify():
-            try:
-                proof.verify()
-            except (AccessError, OSError, ValueError, TypeError):
-                raise TargetError('scope_identity_changed', 'Target identity changed before publication.',
-                                  permanent=True) from None
+        def verify_path():
             self._guard(root)
             if self._policy(project, target.worktree_id, root, parts) != target.relevant_policy_version:
                 raise TargetError('scope_identity_changed', 'Target path policy changed before publication.',
                                   permanent=True)
 
-        return verify
+        return PublicationProof(proof, verify_path)
 
     def _check_existing_parents(self, target):
         fd = None
@@ -484,6 +497,8 @@ class FileTargets:
             return max(matches, key=lambda item: item[0])[1] if matches else None
 
     def capabilities(self):
+        # The result names every visible project, including those with no available worktrees.
+        require_request_epoch(self.catalog, all_projects=True)
         with self.catalog._private_read_guard():
             self._refresh()
             projects = []
@@ -501,7 +516,7 @@ class FileTargets:
                                    'special_names': sorted(SPECIAL_NAMES), 'special_trees': SPECIAL_TREES,
                                    'special_files': SPECIAL_FILES, 'explicit_worktree_required': True}}
 
-    def cleanup_created(self, target, created):
+    def cleanup_created(self, target, created, *, late_check=None):
         """Remove only recorded directories that still have the same identity and are empty."""
         removed = []
         for record in sorted(created, key=lambda item: len(self._parts(item.path)), reverse=True):
@@ -518,6 +533,8 @@ class FileTargets:
                     self._boundary(fd)
                 entry = os.stat(parts[-1], dir_fd=fd, follow_symlinks=False)
                 if stat.S_ISDIR(entry.st_mode) and _identity(entry) == record.identity:
+                    if late_check is not None:
+                        late_check()
                     os.rmdir(parts[-1], dir_fd=fd)
                     removed.append(record.path)
             except (OSError, TargetError):

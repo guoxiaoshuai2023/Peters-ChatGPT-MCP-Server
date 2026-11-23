@@ -90,6 +90,65 @@ class UnifiedPolicyTests(unittest.TestCase):
                 self.fail("A previous project capability survived withdrawal and re-addition.")
         self.assertEqual(rejected.exception.code, "scope_revoked")
 
+    def test_restoring_another_locations_receipt_cannot_supply_a_time_window(self):
+        start, end = 100_000_000, 200_000_000
+        first, other = "a" * 64, "b" * 64
+        self.assertTrue(self.store.verified_location_span(first, ((start, end),), start, end))
+        self.assertFalse(self.store.verified_location_span(other, (), start, end))
+        a = self.store.path / (".project-occupancy-" + first) / "observed.json"
+        b = self.store.path / (".project-occupancy-" + other) / "observed.json"
+        b.write_bytes(a.read_bytes())
+        b.chmod(0o600)
+        with self.assertRaises(AccessError):
+            self.store.verified_location_span(other, (), start, end)
+        b.write_text(json.dumps([[start, end]]))
+        self.assertFalse(self.store.verified_location_span(other, (), start, end))
+
+    def test_mount_edge_starts_at_observation_and_keeps_its_closed_interval_on_restart(self):
+        from types import SimpleNamespace
+        from peters_mcp import history_location
+        import time
+
+        identity = self.policy.snapshot().project_identities["main"]
+        key = history_location.owner_key(self.project, identity, None)
+        original = history_location._edge_since
+        leaf = self.project.stat().st_ino
+
+        def synthetic_mount(child, parent, observed):
+            if child.st_ino == leaf:
+                parent = SimpleNamespace(st_dev=child.st_dev + 1, st_ctime_ns=parent.st_ctime_ns)
+            return original(child, parent, observed)
+
+        with patch.object(history_location, "_edge_since", side_effect=synthetic_mount):
+            origin = time.time_ns()
+            warm = history_location.LocationWitnesses()
+            self.addCleanup(warm.close)
+            first = warm.observe(self.project, identity["birthtime_ns"], identity)
+            self.assertFalse(self.store.verified_location_span(key, first, origin, origin))
+            future = time.time_ns()
+            continuous = warm.observe(self.project, identity["birthtime_ns"], identity)
+            self.assertTrue(self.store.verified_location_span(key, continuous, future, future))
+            warm.close()
+            cold = history_location.LocationWitnesses()
+            self.addCleanup(cold.close)
+            reopened = cold.observe(self.project, identity["birthtime_ns"], identity)
+            self.assertFalse(any(lo <= future <= hi for lo, hi in reopened))
+            self.assertTrue(self.store.verified_location_span(key, reopened, future, future))
+            self.assertFalse(self.store.verified_location_span(key, reopened, origin, origin))
+
+    def test_cached_and_denied_queries_preserve_newly_observed_closed_intervals(self):
+        key = "9" * 64
+        second = 1_000_000_000
+        first = (100 * second, 200 * second)
+        same = (125 * second, 150 * second)
+        self.assertTrue(self.store.verified_location_span(key, (first,), *same))
+        self.assertTrue(self.store.verified_location_span(key, ((150 * second, 300 * second),), *same))
+        self.assertFalse(self.store.verified_location_span(key, ((400 * second, 500 * second),), 350 * second, 350 * second))
+        cold = GenerationStore(self.store.path)
+        self.assertTrue(cold.verified_location_span(key, (), 125 * second, 275 * second))
+        self.assertTrue(cold.verified_location_span(key, (), 425 * second, 475 * second))
+        self.assertFalse(cold.verified_location_span(key, (), 275 * second, 425 * second))
+
     def test_unrelated_project_change_keeps_existing_admission(self):
         original_token = self.policy.project_token("main")
         second = self.base / "second"

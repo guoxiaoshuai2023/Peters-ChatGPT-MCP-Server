@@ -29,6 +29,7 @@ from peters_mcp.server import create_server
 from peters_mcp.workspaces import RepositoryRegistry
 from tests import test_export_protocol as protocol_fixture
 from tests.test_file_receiver import synthetic_receive
+from tests.test_workspaces import fixture_git, fixture_registered_worktree
 
 
 OWNER = 'a' * 64
@@ -223,6 +224,53 @@ class UnifiedOriginalFileTests(unittest.TestCase):
                 verify()
         self.assertFalse((external / 'proposed').exists())
 
+    def publish_during_foreign_worktree_move(self, *, overlaps):
+        external, _ = self.external_worktree()
+        destination = (self.other if overlaps else self.base) / 'moved-worktree'
+        writer = self.writer()
+        job = writer.submit(**self.save_args(writer, project='other'))['job_id']
+        original = writer.targets.publication_proof
+        moved = threading.Event()
+
+        def move_before_commit(target):
+            proof = original(target)
+            if not moved.is_set():
+                fixture_git(self.repo, 'worktree', 'move', str(external), str(destination))
+                moved.set()
+            return proof
+
+        with patch.object(writer.targets, 'publication_proof', move_before_commit):
+            writer.start()
+            self.assertTrue(moved.wait(7))
+            self.wait_for(lambda: writer._get(job)['state'] in ('failed', 'completed', 'authorization_blocked'))
+        return writer._get(job)
+
+    def test_background_publish_rejects_new_foreign_overlap_before_mkdir(self):
+        row = self.publish_during_foreign_worktree_move(overlaps=True)
+        self.assertFalse(row['published'])
+        self.assertFalse((self.other / 'new').exists())
+
+    def test_background_publish_continues_across_unrelated_registration_change(self):
+        row = self.publish_during_foreign_worktree_move(overlaps=False)
+        self.assertEqual(row['state'], 'completed')
+        self.assertTrue((self.other / 'new/file.bin').is_file())
+
+    def test_background_publish_revalidates_an_unrelated_change_after_intent(self):
+        external, _ = self.external_worktree()
+        changed = threading.Event()
+
+        def move_after_intent(phase, job_id):
+            if phase == 'publish_intent' and not changed.is_set():
+                fixture_git(self.repo, 'worktree', 'move', str(external), str(self.base / 'unrelated'))
+                changed.set()
+
+        writer = self.writer(fault_hook=move_after_intent)
+        job = writer.submit(**self.save_args(writer, project='other'))['job_id']
+        writer.start()
+        self.assertTrue(changed.wait(7))
+        self.wait_for(lambda: writer._get(job)['state'] == 'completed')
+        self.assertTrue((self.other / 'new/file.bin').is_file())
+
     def test_revoked_receiver_is_reaped_even_if_first_stop_attempt_is_unconfirmed(self):
         writer = self.writer()
         args = self.save_args(writer)
@@ -251,6 +299,63 @@ class UnifiedOriginalFileTests(unittest.TestCase):
         self.assertTrue(writer._get(job)['writer_exited'])
         self.assertFalse((self.repo / 'new').exists())
 
+    def test_shutdown_reaps_receiver_registered_while_the_coordinator_is_stopping(self):
+        writer = self.writer()
+        args = self.save_args(writer)
+        writer.submit(**args)
+        booting = threading.Event()
+        receivers = []
+        spawn = ReceiverHandle.spawn
+
+        def finish_boot_during_shutdown(*args, **options):
+            booting.set()
+            if not writer._stop.wait(5):
+                raise TimeoutError("The service did not begin shutdown")
+            handle = spawn(*args, **options)
+            receivers.append(handle)
+            return handle
+
+        try:
+            with patch.object(ReceiverHandle, 'spawn', side_effect=finish_boot_during_shutdown):
+                writer.start()
+                self.assertTrue(booting.wait(5))
+                status = writer.close(timeout=6)
+            self.assertEqual(len(receivers), 1)
+            self.assertEqual(status['state'], 'stopped')
+            self.assertIsNone(receivers[0].process)
+            self.assertFalse((self.repo / 'new').exists())
+        finally:
+            for handle in receivers:
+                if handle.process is not None:
+                    handle.stop(timeout=2, force_owned=True)
+                    handle.dispose()
+
+    def test_short_shutdown_retains_coordinator_until_late_receiver_is_settled(self):
+        writer = self.writer()
+        job = writer.submit(**self.save_args(writer))['job_id']
+        booting, resume = threading.Event(), threading.Event()
+        spawn = ReceiverHandle.spawn
+
+        def slow_boot(*args, **options):
+            booting.set()
+            if not resume.wait(5):
+                raise TimeoutError("The receiver was not released")
+            return spawn(*args, **options)
+
+        with patch.object(ReceiverHandle, 'spawn', side_effect=slow_boot):
+            writer.start()
+            try:
+                self.assertTrue(booting.wait(5))
+                first = writer.close(timeout=.05)
+                self.assertEqual(first['state'], 'shutdown_pending')
+                self.assertFalse(first['coordinator_released'])
+            finally:
+                resume.set()
+            second = writer.close(timeout=6)
+        self.assertEqual(second, {'state': 'stopped', 'isolated_receivers': 0, 'coordinator_released': True})
+        self.assertIsNone(writer._handles[job].process)
+        self.assertFalse((self.repo / 'new').exists())
+
     def test_permit_gate_timeout_retries_receiver_cleanup_without_resuming(self):
         writer = self.writer()
         job = writer.submit(**self.save_args(writer))['job_id']
@@ -259,11 +364,11 @@ class UnifiedOriginalFileTests(unittest.TestCase):
         actual_stop = ReceiverHandle.stop
 
         @contextmanager
-        def fail_first_worker_reservation(catalog, project_id, token):
+        def fail_first_worker_reservation(catalog, project_id, token, **options):
             if threading.current_thread().name.startswith('file-coordinator') and not entered.is_set():
                 entered.set()
                 raise AccessError('Fixture permit gate timed out.', code='restart_required')
-            with reserve(catalog, project_id, token):
+            with reserve(catalog, project_id, token, **options):
                 yield
 
         def stop_once_unconfirmed(receiver, *args, **kwargs):
@@ -375,21 +480,31 @@ class UnifiedOriginalFileTests(unittest.TestCase):
         _, link = self.chunked()
         self.assert_partial_delivery_fenced(link, sink)
 
-    def assert_partial_delivery_fenced(self, link, sink):
+    def test_foreign_worktree_move_stops_actual_body_frames(self):
+        side = self.base / 'side'
+        row = fixture_registered_worktree(self.other, side)
+        self.apply({**self.document, 'projects': [self.document['projects'][0], row]})
+        sink = []
+        self.exporter(sink)
+        _, link = self.exported()
+        self.assert_partial_delivery_fenced(link, sink, lambda: fixture_git(
+            self.other, 'worktree', 'move', str(side), str(self.repo / 'side')))
+
+    def assert_partial_delivery_fenced(self, link, sink, change=None):
         sink.clear()
         armed, advance = threading.Event(), threading.Event()
         reservation = file_export_tools.async_commit_project
         attempts = 0
 
         @asynccontextmanager
-        async def pause_before_second_body(catalog, project_id, token):
+        async def pause_before_second_body(catalog, project_id, token, **options):
             nonlocal attempts
             attempts += 1
             if attempts == 3:  # Real header, first body frame, second body frame.
                 armed.set()
                 if not await asyncio.to_thread(advance.wait, 5):
                     raise TimeoutError()
-            async with reservation(catalog, project_id, token):
+            async with reservation(catalog, project_id, token, **options):
                 yield
 
         def read_resource():
@@ -410,7 +525,7 @@ class UnifiedOriginalFileTests(unittest.TestCase):
             try:
                 self.assertTrue(armed.wait(5))
                 self.assertEqual(sink, [(CHUNK, True)])
-                self.revoke()
+                (change or self.revoke)()
             finally:
                 advance.set()
                 reader.join(5)

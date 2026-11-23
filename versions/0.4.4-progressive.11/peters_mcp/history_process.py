@@ -6,6 +6,7 @@ inside the child for each live delivery request, including delayed polling.
 
 import base64
 from collections import deque
+from contextlib import nullcontext
 from dataclasses import asdict
 import hashlib
 import hmac
@@ -90,7 +91,29 @@ def _rss_bytes(pid):
             return 0
 
 
+def _delivery_project(operation, arguments, result):
+    if operation in {"read_codex_thread", "read_agent_thread"}:
+        return result.get("thread", {}).get("project_id")
+    # A globally scoped legacy find or item without project evidence needs all
+    # projects. Source scans and project-filtered finds have an explicit scope.
+    return arguments.get("project_id") or None
+
+
+class _ValidatedTopology:
+    def __init__(self, project_id):
+        self.project_id = project_id
+        self.digest = None
+
+    def observe(self, receipt):
+        digest = receipt.digest_for(self.project_id)
+        if self.digest is not None and self.digest != digest:
+            raise AccessError("Project topology changed during validation.", code="restart_required")
+        self.digest = digest
+
+
 def _worker(connection, spec, factory, task_ttl):
+    from .workspaces import observe_validation_topology
+    unified = spec.get("unified_policy") is not None
     connection.setblocking(False)
     incoming = bytearray()
     tasks = {}
@@ -204,8 +227,13 @@ def _worker(connection, spec, factory, task_ttl):
                     task["iterator"] = iter(core.revalidate_result_iter(
                         task["operation"], task["arguments"], task["result"]))
                     task["phase"] = "validation"
+                    if unified:
+                        task["topology"] = _ValidatedTopology(
+                            _delivery_project(task["operation"], task["arguments"], task["result"]))
                 try:
-                    checkpoint = next(task["iterator"])
+                    observation = task.get("topology") if task["phase"] == "validation" else None
+                    with observe_validation_topology(observation.observe) if observation else nullcontext():
+                        checkpoint = next(task["iterator"])
                     phase = checkpoint.get("phase") if isinstance(checkpoint, dict) else None
                     task["checkpoint"] = phase if phase in PHASES else "unknown"
                 except StopIteration as finished:
@@ -216,12 +244,20 @@ def _worker(connection, spec, factory, task_ttl):
                     task["iterator"] = None
                     task["phase"] = "done"
                     if validating:
+                        extra = {}
+                        if unified:
+                            proof = task["topology"]
+                            project_id = _delivery_project(task["operation"], task["arguments"], task["result"])
+                            if proof.digest is None or project_id != proof.project_id:
+                                raise AccessError("Physical project scope was not verified.", code="restart_required")
+                            extra["topology_digest"] = proof.digest
+                            extra["delivery_aliases"] = getattr(task["result"], "delivery_aliases", [])
                         send({"type": "delivery_start"})
                         # A late result is retained only in the child. A later demand
                         # will run validation again rather than receiving this page.
                         for nonce, expiry in task["demands"].items():
                             if expiry > time.monotonic():
-                                send({"type": "delivery", "id": tid, "nonce": nonce, "result": task["result"]})
+                                send({"type": "delivery", "id": tid, "nonce": nonce, "result": task["result"], **extra})
                         task["demands"].clear()
                     if validating:
                         send({"type": "complete", "id": tid, "revision": task["revision"]})
@@ -250,6 +286,7 @@ class IsolatedHistory:
     def __init__(self, history, *, _factory=None, wait_seconds=4.0, step_seconds=3.0,
                  worker_rss=256 * 1024 * 1024, ttl=CURSOR_TTL, _spec_extra=None, _max_tasks=5):
         catalog = history.catalog
+        self._catalog = catalog
         self._spec = {"config_path": str(history.config_path) if history.config_path else None,
                       "project_ids": sorted(history.project_ids), "catalog_path": None, "projects": []}
         if getattr(history, "unified_policy", None) is not None:
@@ -623,9 +660,31 @@ class IsolatedHistory:
                 # Existing processing tokens still retain their original task.
                 if self._keys.get(task["key"]) == task["id"]:
                     self._keys.pop(task["key"], None)
-                return reply["result"]
-            return {"status": "processing", "next_cursor": self._token(task),
-                    "continue_with": "Call the same tool with the same arguments, replacing cursor with next_cursor."}
+            else:
+                return {"status": "processing", "next_cursor": self._token(task),
+                        "continue_with": "Call the same tool with the same arguments, replacing cursor with next_cursor."}
+        # Join the child's validated discovery with evidence retained by this requesting
+        # process, outside the supervisor lock. Neither the digest nor paths enter public results.
+        result = reply["result"]
+        if self._spec.get("unified_policy") is not None:
+            from .project_guard import verify_worker_aliases
+            project_id = _delivery_project(operation, arguments, result)
+            self._verify_delivery_topology(reply.get("topology_digest"), project_id)
+            verify_worker_aliases(self._catalog, project_id, reply.get("delivery_aliases"))
+        return result
+
+    def _verify_delivery_topology(self, digest, project_id):
+        from .project_guard import project_token, require_request_epoch
+        from .workspaces import discovery_deadline
+        with discovery_deadline(time.monotonic() + self._step_seconds):
+            self._catalog.refresh()
+            observed = self._catalog.repositories.discover_all().topology
+            if not observed.complete or observed.digest_for(project_id) != digest:
+                raise AccessError("Project topology changed after history validation.", code="restart_required")
+        if project_id is None:
+            require_request_epoch(self._catalog, all_projects=True)
+        else:
+            project_token(self._catalog, project_id)
 
     def find_codex_threads(self, query="", project_id="", cursor="", limit=10):
         return self._call("find_codex_threads", dict(query=query, project_id=project_id, cursor=cursor, limit=limit))

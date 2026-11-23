@@ -436,12 +436,12 @@ protected in the manifest; no remove/unprotect API is provided.
             raise _error('A protection guard must remain held for the complete operation.')
 
     @contextmanager
-    def read_guard(self):
+    def read_guard(self, *, deadline=None):
         current = getattr(self._local, 'guard', None)
         if current is not None:
             yield current
             return
-        with self._locked() as (fd, info, _):
+        with self._locked(deadline=deadline) as (fd, info, _):
             data, digest = self._load(fd, info)
             def health_check():
                 current, checked = self._load(fd, info)

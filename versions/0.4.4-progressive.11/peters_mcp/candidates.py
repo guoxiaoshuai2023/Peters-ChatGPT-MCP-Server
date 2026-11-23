@@ -296,6 +296,15 @@ class CandidateDelivery:
         token = project_token(self.catalog, project.id)
         if payload.get("scope") != token or payload.get("actor") != self._actor():
             raise AccessError("The candidate preview is no longer authorized.", code="scope_revoked")
+        discovery = self.catalog.repositories.discover(project.id)
+        main = next((row for row in discovery["worktrees"] if row["is_default"]), None)
+        if main is None or main["state"] != "valid" or main["root"] != str(project.root):
+            raise AccessError("Candidate project membership changed.", code="scope_changed")
+
+        def reservation():
+            return commit_project(self.catalog, project.id, token, topology=discovery.topology,
+                                  private_registry=self.catalog._private_registry)
+
         parent = tuple(payload["existing_parent"])
         delivery_id = payload["delivery_id"]
         probe = None
@@ -322,7 +331,7 @@ class CandidateDelivery:
             if delivery_id in self._publications:
                 fd = stack.enter_context(self.catalog.open_path(project, parts, directory=True))
                 directory_identity, file_identity = self._publications[delivery_id]
-                with commit_project(self.catalog, project.id, token):
+                with reservation():
                     validate_directory(parts, directory_identity)
                     if not self._matches_publication(fd, filename, raw, file_identity):
                         raise AccessError("Prior publication cannot be verified. Prepare again.")
@@ -336,24 +345,26 @@ class CandidateDelivery:
                 raise AccessError("Candidate parent changed since preview. Prepare again.")
             self._attempts.add(delivery_id)
             try:
-                with commit_project(self.catalog, project.id, token):
-                    validate_directory(parent, payload["directory_identity"])
-                    for component in parts[len(parent):]:
+                identity = payload["directory_identity"]
+                for component in parts[len(parent):]:
+                    with reservation():
+                        validate_directory(parent, identity)
                         os.mkdir(component, 0o755, dir_fd=fd)
                         child = os.open(component, DIRECTORY_FLAGS, dir_fd=fd)
                         stack.callback(os.close, child)
-                        created.append((fd, component, self._identity(child)))
-                        fd = child
-                    identity = self._identity(fd)
+                        identity = self._identity(child)
+                        created.append((fd, component, identity))
+                        parent, fd = (*parent, component), child
+                with reservation():
                     validate_directory(parts, identity)
                     self._require_absent(fd, filename)
                     writer = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
                                      0o600, dir_fd=fd)
-                with os.fdopen(writer, "wb", closefd=False) as output:
-                    output.write(raw)
-                    output.flush()
+                    with os.fdopen(writer, "wb", closefd=False) as output:
+                        output.write(raw)
+                        output.flush()
                 os.fsync(writer)
-                with commit_project(self.catalog, project.id, token):
+                with reservation():
                     validate_directory(parts, identity)
                     staged = os.stat(temporary, dir_fd=fd, follow_symlinks=False)
                     written = os.fstat(writer)
@@ -366,7 +377,7 @@ class CandidateDelivery:
                     publish_exclusive(fd, temporary, filename)
                     published = True
                 os.fsync(fd)
-                with commit_project(self.catalog, project.id, token):
+                with reservation():
                     validate_directory(parts, identity)
                     if not self._matches_publication(fd, filename, raw, file_identity):
                         raise AccessError("Published candidate changed; inspect the outcome.")

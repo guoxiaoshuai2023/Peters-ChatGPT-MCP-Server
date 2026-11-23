@@ -348,6 +348,10 @@ def _visible_text(message, role, producer):
 
 class _EventScan:
     def __init__(self, header, prefix_size):
+        self.created_at = header.created_at
+        self.last_ms = 0 if header.seeded else header.created_at
+        self.last_commit_ms = header.created_at
+        self.ordered = True
         self.contexts = {header.cwd: None} if header.cwd else {}
         self.complete = bool(header.cwd)
         self.warnings = set()
@@ -364,6 +368,10 @@ class _EventScan:
 
     def add(self, event, line, *, messages):
         kind, seq, data = event['type'], event['seq'], event['data']
+        self.ordered = self.ordered and event['time'] >= self.last_ms
+        self.created_at = min(self.created_at, event['time'])
+        self.last_ms = max(self.last_ms, event['time'])
+        self.last_commit_ms = max(self.last_commit_ms, self.last_ms)
         if kind not in _EVENTS:
             self.complete = False
             self.warnings.add('unknown_event_skipped')
@@ -654,6 +662,9 @@ class Adapter:
             yield None, None, False
 
     def _provenance(self, locations, header, scan):
+        earliest = scan.created_at
+        latest = scan.last_commit_ms
+        ordered = scan.ordered
         contexts = dict(scan.contexts)
         ancestors = {}
         related = dict(scan.related)
@@ -661,10 +672,13 @@ class Adapter:
         complete = scan.complete
 
         def observe(native_id, other):
-            nonlocal complete
+            nonlocal complete, earliest, latest, ordered
             if native_id != header.native_id:
                 ancestors[native_id] = None
             if other is not None:
+                earliest = min(earliest, other.created_at)
+                latest = max(latest, other.last_commit_ms)
+                ordered = ordered and other.ordered
                 contexts.update(other.contexts)
                 related.update(other.related)
                 warnings.update(other.warnings)
@@ -696,7 +710,7 @@ class Adapter:
             other_header, other, _, _, _ = self._scan(location, messages=False)
             observe(native_id, other)
             parents(other_header, other)
-        return tuple(contexts), tuple(ancestors), complete, tuple(sorted(warnings))
+        return tuple(contexts), tuple(ancestors), complete, tuple(sorted(warnings)), earliest, latest if ordered else None
 
     def snapshot(self, thread):
         locations = _NativeLocations(self) if thread.location else self._index()
@@ -706,6 +720,7 @@ class Adapter:
         header, scan, revision, identity, proof = self._scan(location, messages=True)
         if header.subagent or header.native_id != thread.native_id:
             raise _unsupported()
-        contexts, ancestors, complete, warnings = self._provenance(locations, header, scan)
+        contexts, ancestors, complete, warnings, earliest, latest = self._provenance(locations, header, scan)
         return Projection(tuple(scan.messages), revision, identity, contexts, ancestors,
-                          complete, warnings, title=scan.title, prefix=proof)
+                          complete, warnings, title=scan.title, prefix=proof, origin_ns=earliest * 1_000_000,
+                          last_ns=(latest + 1) * 1_000_000 - 1 if latest is not None else None)

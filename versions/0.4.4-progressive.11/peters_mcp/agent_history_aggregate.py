@@ -11,6 +11,7 @@ import time
 from .agent_history import ERROR_CODES, VERSION, _restart, coverage_status, unified
 from .agent_history_policy import AGENT, IDENTIFIER
 from .catalog import AccessError, integer
+from .project_guard import collect_page_aliases, retain_history_aliases
 
 _MAX_SEARCHES = 12
 _MAX_AGE = 300
@@ -312,8 +313,9 @@ class AggregateFind:
             page = state.ordered[state.offset:end]
             if state.validation is None:
                 state.validation = _validation_tasks(page)
-            if not self._validate(state, project_id, caller):
-                return self._continuation(state, scope, params)
+            with collect_page_aliases(self._core.policy) as aliases:
+                if not self._validate(state, project_id, caller):
+                    return self._continuation(state, scope, params)
             if self._configuration(project_id, caller).key != scope.key:
                 raise _restart()
             coverage = [state.coverage[source] for source in state.sources]
@@ -328,6 +330,7 @@ class AggregateFind:
                       "has_more": more, "next_cursor": self._cursor(state, scope, params) if more else None}
             if not more:
                 self._discard(state)
+            retain_history_aliases(self._core.policy, aliases)
             return result
         except Exception:
             self._discard(state)

@@ -248,6 +248,16 @@ class Catalog:
                                      registration_identities=snapshot.project_identities)
         catalog._history_policy = policy
         catalog._view = replace(catalog._view, digest=snapshot[1])
+        catalog._view.repositories.generation = snapshot[1]
+        catalog._view.repositories.history_windows = snapshot.root_history
+        catalog._view.repositories.history_store = policy.store
+        for project in catalog._view.projects.values():
+            identity = project.registration_identity
+            try:
+                policy.store.locations.observe(project.root, identity["birthtime_ns"], identity)
+            except (AccessError, OSError):
+                # File tools retain their own root checks when history lacks a witness.
+                pass
         return catalog
 
     @classmethod

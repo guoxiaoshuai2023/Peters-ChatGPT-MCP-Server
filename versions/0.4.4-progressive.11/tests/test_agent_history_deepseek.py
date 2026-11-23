@@ -190,13 +190,14 @@ class DeepSeekHistoryTests(unittest.TestCase):
     def test_fork_reports_own_parent_and_recorded_workspaces(self):
         inherited = [user(0, 'parent says something'), event(1, 'working-directory/change', {'cwd': '/parent/fork'})]
         self.write('--parent-main--/parent/session.v4.jsonl', records(
-            header('parent', '/parent/main'), *inherited, assistant(2, 'after the fork')))
+            header('parent', '/parent/main', createdAt=CREATED - 1000), *inherited, assistant(2, 'after the fork')))
         self.write('--project-main--/child/session.v4.jsonl', records(
             header('child', parentSession='parent', isSeeded=True), *inherited,
             event(2, 'session/end-seed', {'inherited': True}), user(3, 'child opens a turn')))
         result = self.projection('child')
         self.assertEqual(result.contexts, ('/project/main', '/parent/fork', '/parent/main'))
         self.assertEqual(result.ancestors, ('parent',))
+        self.assertEqual(result.origin_ns, (CREATED - 1000) * 1_000_000)
         self.assertTrue(result.context_complete)
         self.assertEqual([x.text for x in result.messages], ['parent says something', 'child opens a turn'])
 

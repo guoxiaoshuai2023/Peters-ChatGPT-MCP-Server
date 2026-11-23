@@ -176,7 +176,7 @@ class FileSources:
                                   sorted(self._retained_aliases | self._aliases(self.protected_paths))])
                 scope = _digest([project_id, worktree_id, str(root), identity,
                                  member['repository_id'], discovered['fingerprint'], policy, health])
-                return read_project, member['repository_id'], policy, scope, grant, project, member
+                return read_project, member['repository_id'], policy, scope, grant, project, getattr(discovered, 'topology', None), member
             except AccessError:
                 raise
             except (OSError, RuntimeError, ValueError, KeyError, TypeError):
@@ -205,7 +205,7 @@ class SourceScope:
         self.sources, self.actor, self.guard = sources, actor, guard
         self.project_id, self.worktree_id = project_id, worktree_id
         (self.project, self.repository_id, self.policy_version, self.scope_key,
-         self.project_grant, self.configured_project, _) = data
+         self.project_grant, self.configured_project, self.topology, _) = data
         self.root, self.root_identity = self.project.root, self.project.root_identity
         self._thread = threading.get_ident()
         self._closed = False
@@ -228,7 +228,7 @@ class SourceScope:
         if self.project_grant is None:
             return None
         try:
-            return FileRootsProof.capture(self.configured_project, self.root, self.root_identity)
+            return FileRootsProof.capture(self.configured_project, self.root, self.root_identity, self.topology)
         except (OSError, ValueError, TypeError):
             raise _error('scope_changed') from None
 

@@ -1,7 +1,7 @@
 """Authorization and bounded search/read for agent history adapters."""
 
 import base64
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 import hashlib
 import hmac
@@ -11,11 +11,12 @@ import re
 import secrets
 import time
 
-from .agent_history_policy import AGENT, IDENTIFIER, SOURCE, AgentPolicy
+from .agent_history_policy import AGENT, IDENTIFIER, SOURCE, AgentPolicy, migration_location_current
 from .agent_history_source import Message, Projection, Thread, clear_snapshot_copies
 from .catalog import AccessError, Catalog, Project, integer
 from .history import HistoryAccess, utc
 from .history_projection import sanitize
+from .history_location import check_origins
 
 VERSION = "agent-visible-v1"
 TTL = 1800
@@ -143,10 +144,13 @@ class Record:
         return _digest((self.source_instance or self.source_id, self.thread.native_id))
 
     @property
+    def display_metadata(self):
+        return self.title, self.thread.agent, self.thread.surface, self.backend, self.projection.warnings
+
+    @property
     def proof(self):
-        return _digest((self.contexts, self.projection.identity, self.projection.revision,
-                        self.fingerprint, self.title, self.thread.updated_at,
-                        self.thread.agent, self.thread.surface, self.projection.warnings))
+        return _digest((self.canonical, self.contexts, self.projection.identity, self.projection.revision,
+                        self.fingerprint, self.thread.updated_at, self.display_metadata))
 
 
 @dataclass
@@ -158,6 +162,7 @@ class RequestScope:
     key: str
     associations: dict
     worktrees: dict
+    delivery_aliases: set = field(default_factory=set)
 
 
 @dataclass(frozen=True)
@@ -171,12 +176,14 @@ class SnapshotProof:
     prefix: tuple[str, int, str] | None
     fingerprint: str
     count: int
+    display_metadata: tuple
+    updated_at: str
 
     @classmethod
     def from_record(cls, record):
         return cls(record.source_id, record.thread.native_id, record.canonical, record.contexts,
                    record.projection.identity, record.projection.revision, record.projection.prefix,
-                   record.fingerprint, len(record.entries))
+                   record.fingerprint, len(record.entries), record.display_metadata, record.thread.updated_at)
 
 
 class Prepared(dict):
@@ -211,7 +218,14 @@ class AgentHistoryCore:
         worktrees = self.catalog.repositories.discover_all()
         if not any(entry["state"] == "valid" for entry in worktrees[project]["worktrees"] if entry["is_default"]):
             raise _deny()
-        membership = {item: data["fingerprint"] for item, data in worktrees.items()}
+        if unified(self.policy):
+            topology = getattr(worktrees, "topology", None)
+            if topology is not None and not topology.complete:
+                raise _error("Project workspace membership could not be verified.", "restart_required")
+            # Discovery already resolved overlaps against every registered project.
+            membership = worktrees[project]["fingerprint"]
+        else:
+            membership = {item: data["fingerprint"] for item, data in worktrees.items()}
         token_scope = _digest((version, self.catalog._config_digest, membership, project, actor, policy_actor))
         return RequestScope(sources, project, actor, policy_actor, token_scope, {}, worktrees)
 
@@ -241,8 +255,12 @@ class AgentHistoryCore:
     def _mapped_context(self, scope, source, thread, context, ancestors):
         if not unified(self.policy):
             return context, None
-        candidates = [alias for alias in getattr(source, "path_aliases", ())
-                      if alias["old_root"] == context and alias["project_id"] == scope.project]
+        aliases = [alias for alias in getattr(source, "path_aliases", ()) if alias["project_id"] == scope.project]
+        if isinstance(context, str) and any(Path(alias["old_root"]) in Path(context).parents for alias in aliases):
+            # An explicitly pinned transcript cannot turn a migration mapping
+            # into a wildcard for other folders under the former pathname.
+            raise _deny()
+        candidates = [alias for alias in aliases if alias["old_root"] == context]
         if not candidates:
             return context, None
         matching = [alias for alias in candidates if alias["native_project_id"] == thread.native_project_id]
@@ -254,32 +272,20 @@ class AgentHistoryCore:
                 or len(lineage) != len(thread.ancestor_projects)
                 or any(lineage.get(native) != thread.native_project_id for native in ancestors)):
             raise _deny()
-        old = Path(alias["old_root"])
+        # A path can be temporarily reused by another project and disappear
+        # again. Only an explicitly reviewed native ID and cut may use this map.
+        evidence = source.exceptions.get(thread.native_id)
+        if (evidence is None or source.threads.get(thread.native_id) != scope.project
+                or evidence.get("project_id") != scope.project):
+            raise _error("The historical migration snapshot has not been reviewed.", "association_unverified")
         target = Path(alias["target_root"])
-        try:
-            canonical_old = old.resolve()
-        except (OSError, RuntimeError):
-            raise _deny() from None
-        if canonical_old != old or target != self.catalog.projects[scope.project].root:
+        if target != self.catalog.projects[scope.project].root or not migration_location_current(alias):
             raise _deny()
-        try:
-            old.lstat()
-        except FileNotFoundError:
-            pass
-        except OSError:
-            raise _deny() from None
-        else:
-            # A mapping never reinterprets a directory that has since been reused.
-            raise _deny()
-        from .fs_identity import persistent_identity
-        try:
-            if persistent_identity(target) != alias["target_identity"]:
-                raise _deny()
-        except (OSError, AccessError):
-            raise _deny() from None
-        return str(target), _digest(alias)
+        fingerprint = _digest(alias)
+        scope.delivery_aliases.add(fingerprint)
+        return str(target), fingerprint
 
-    def _binding(self, scope, source, thread, projection=None):
+    def _binding(self, scope, source, thread, projection=None, *, used_mappings=None):
         ancestors = set(thread.ancestors)
         contexts = set(thread.contexts)
         complete = thread.context_complete
@@ -294,7 +300,7 @@ class AgentHistoryCore:
             raise _deny()
         if len(contexts) > 128 or len(ancestors) > 128:
             raise _deny()
-        membership, mappings = [], []
+        membership, mappings, witnesses = [], [], []
         for context in sorted(contexts):
             context, mapping = self._mapped_context(scope, source, thread, context, ancestors)
             if mapping is not None:
@@ -307,12 +313,16 @@ class AgentHistoryCore:
             if result["state"] in {"outside", "ambiguous"} or (result["state"] == "matched"
                                                                and result["project_id"] != scope.project):
                 raise _deny()
+            if mapping is None and "history_windows" in result:
+                witnesses.extend(result["history_windows"])
             membership.append((context, result["state"], result["worktree_id"], result["repository_id"]))
         if projection is not None and assigned is None:
             if not source.inherit or not complete or not membership or any(item[1] != "matched" for item in membership):
                 if unified(self.policy) and any(item[1] == "matched" for item in membership):
                     raise _error("The session's complete project association is unverified.", "association_unverified")
                 raise _deny()
+            if not check_origins(projection.origin_ns, projection.last_ns, witnesses):
+                raise _error("The session's physical project at creation is unverified.", "association_unverified")
         if projection is None and assigned is None and not source.inherit:
             raise _deny()
         if projection is not None and assigned is not None and unified(self.policy):
@@ -321,12 +331,20 @@ class AgentHistoryCore:
                         "source_identity": projection.identity,
                         "source_revision": projection.revision,
                         "project_fingerprint": scope.worktrees[scope.project]["fingerprint"]}
+            if exception is not None and "migration_metadata_sha256" in exception:
+                from .agent_history_path_migration import metadata_digest
+                aliases = [alias for alias in source.path_aliases if _digest(alias) in mappings]
+                if len(aliases) != 1:
+                    raise _error("The reviewed directory migration is unavailable.", "association_unverified")
+                expected["migration_metadata_sha256"] = metadata_digest(thread, aliases[0])
             if exception != expected:
                 raise _error("The verified historical association no longer matches its source.",
                              "association_unverified")
         proof = (assigned, complete, membership, sorted(ancestors))
         if unified(self.policy):
             proof += (thread.native_project_id, thread.ancestor_projects, sorted(mappings))
+        if used_mappings is not None:
+            used_mappings.update(mappings)
         return _digest(proof)
 
     def _codex_config(self, scope=None):
@@ -360,7 +378,9 @@ class AgentHistoryCore:
                         for item in projection["messages"])
         # The Codex history engine already canonicalizes and verifies the raw input.
         original = Projection(visible, snapshot["sha256"], _digest((config["scope"], row["rollout_path"])),
-                              warnings=("coverage_unverified",) if not projection["complete_public_projection"] else ())
+                              warnings=("coverage_unverified",) if not projection["complete_public_projection"] else (),
+                              origin_ns=grant.get("_proof_context", {}).get("origin_ns"),
+                              last_ns=grant.get("_proof_context", {}).get("last_ns"))
         binding = _digest((config["scope"], grant.get("_proof"), scope.project))
         instance = scope.sources["codex"].instance_id if unified(self.policy) else ""
         canonical = canonical_identity("codex", instance, native_id)
@@ -405,11 +425,20 @@ class AgentHistoryCore:
         if not isinstance(thread, Thread) or thread.native_id != native_id or not IDENTIFIER.fullmatch(native_id):
             raise _deny()
         self._binding(scope, source, thread)
+        inheritance_snapshot = None
+        if (unified(self.policy) and "migration_metadata_sha256" in source.exceptions.get(native_id, {})):
+            inheritance_snapshot = getattr(adapter, "snapshot_for_inheritance", None)
+            if inheritance_snapshot is None:
+                raise _error("The approved migration format is unavailable.", "association_unverified")
         if (not getattr(adapter, "supports_inheritance", True)
                 and thread.native_id not in source.threads):
-            if unified(self.policy):
+            if not unified(self.policy):
+                raise _deny()
+            # Some native formats need a stronger snapshot for automatic
+            # association than the one pinned by a historical exception.
+            inheritance_snapshot = getattr(adapter, "snapshot_for_inheritance", None)
+            if inheritance_snapshot is None:
                 raise _error("This reader cannot verify complete workspace history.", "association_unverified")
-            raise _deny()
         if thread.native_link is not None:
             if not allow_link:
                 raise _deny()
@@ -435,17 +464,28 @@ class AgentHistoryCore:
                            contexts=_digest((target, link_ownership, child.contexts)),
                            source_instance=source.instance_id if unified(self.policy) else "")
         yield {"phase": "scanning"}
-        projection = adapter.snapshot(thread)
-        binding = self._binding(scope, source, thread, projection)
+        snapshot = inheritance_snapshot or adapter.snapshot
+        projection = snapshot(thread)
+        used_mappings = set()
+        binding = self._binding(scope, source, thread, projection, used_mappings=used_mappings)
         instance = source.instance_id if unified(self.policy) else ""
         canonical = canonical_identity(source_id, instance, native_id)
-        return self._record(source_id, thread, projection, binding, canonical, source.adapter, instance)
+        record = self._record(source_id, thread, projection, binding, canonical, source.adapter, instance)
+        if used_mappings and "migration_metadata_sha256" not in source.exceptions[native_id]:
+            # This historical exception signed only the visible original. Search,
+            # subsequent reads and delivery must not use the mutable index label.
+            title = next((entry.text.lstrip().partition("\n")[0][:500] for entry in record.entries
+                          if entry.role == "user" and entry.text.strip()), "")
+            last_visible = max((entry.timestamp for entry in record.entries), default="")
+            record = replace(record, title=title, thread=replace(record.thread, updated_at=last_visible))
+        return record
 
     def _summary(self, scope, record):
+        pinned = {"snapshot": record.proof} if unified(self.policy) else {}
         result = {"source_id": record.source_id, "agent": record.thread.agent, "surface": record.thread.surface,
                 "stable_thread_id": record.stable_id, "title": record.title, "updated_at": record.thread.updated_at,
                 "project_id": scope.project, "thread_ref": self._token(scope, "thread", actor=scope.actor,
-                         project=scope.project, source=record.source_id, native=record.thread.native_id),
+                         project=scope.project, source=record.source_id, native=record.thread.native_id, **pinned),
                 "source_adapter": scope.sources[record.source_id].adapter if record.source_id in scope.sources else "codex"}
         if unified(self.policy):
             result["source_instance"] = record.source_instance
@@ -680,12 +720,20 @@ class AgentHistoryCore:
         if (frozen.canonical != current.canonical or frozen.contexts != current.contexts
                 or frozen.identity != current.projection.identity):
             raise _restart()
+        if unified(self.policy) and frozen.display_metadata != current.display_metadata:
+            raise _restart()
         if frozen.revision == current.projection.revision and frozen.fingerprint == current.fingerprint:
+            if unified(self.policy) and frozen.updated_at != current.thread.updated_at:
+                raise _restart()
             return
         prefix = frozen.prefix
         if (prefix is None or len(current.entries) < frozen.count
                 or self._message_fingerprint(current.entries[:frozen.count]) != frozen.fingerprint):
             raise _restart()
+        if unified(self.policy):
+            appended = current.projection.prefix
+            if appended is None or appended[0] != prefix[0] or appended[1] <= prefix[1]:
+                raise _restart()
         source_id = frozen.canonical[0]
         if source_id == "codex":
             raise _restart()
@@ -756,6 +804,8 @@ class AgentHistoryCore:
         else:
             frozen = yield from self._load(scope, source_id, native_id)
             cache_id, position, offset = secrets.token_hex(16), 0, 0
+        if unified(self.policy) and ref.get("snapshot") != frozen.proof:
+            raise _restart()
         chosen = self._selected(frozen, view, turn_id)
         page, position, offset = self._page(frozen, chosen, position, offset, limit, max_chars)
         more = position < len(chosen)
@@ -801,6 +851,9 @@ class AgentHistoryCore:
             self._same_snapshot(scope, evidence, current)
         if self._configuration(project_id, arguments["actor"], arguments["policy_actor"]).key != scope.key:
             raise _restart()
+        # Only vouchers in this page were reloaded in this fresh scope. Internal
+        # scans, dropped matches and other pages contribute no delivery conditions.
+        result.delivery_aliases = sorted(scope.delivery_aliases)
         return result
 
 

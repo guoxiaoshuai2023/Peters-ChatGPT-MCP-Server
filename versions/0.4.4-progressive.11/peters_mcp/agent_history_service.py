@@ -4,6 +4,7 @@ from contextlib import contextmanager
 from copy import copy
 from dataclasses import dataclass
 import fcntl
+import multiprocessing
 import os
 from pathlib import Path
 import secrets
@@ -19,8 +20,30 @@ from .agent_history_source import SourceRoot, clear_snapshot_copies
 from .catalog import AccessError
 from .file_context import current_file_actor
 from .history_process import IsolatedHistory
+from .history_location import CHECKPOINT_SECONDS
 
 _MAX_WORKERS = 2
+_CHECKPOINT_BUDGET = 3.0
+
+
+def _monitor_locations(store, stop, ready, interval):
+    """Own the vnode watches in a supervised process, independently of the source readers."""
+    parent = multiprocessing.parent_process()
+    next_project, checkout_indexes = 0, {}
+    try:
+        while parent.is_alive():
+            closing = stop.is_set()
+            try:
+                next_project = store.checkpoint_locations(next_project, checkout_indexes,
+                    deadline=time.monotonic() + _CHECKPOINT_BUDGET, stop=None if closing else stop)
+            except (AccessError, OSError):
+                pass
+            ready.set()
+            if closing:
+                break
+            stop.wait(interval)
+    finally:
+        store.locations.close()
 
 
 def _private():
@@ -69,11 +92,13 @@ class AgentHistoryService:
         self._workers = {}
         self._workspace = None
         self._closed = False
+        self._checkpoint_stop = None
+        self._checkpoint_process = None
         from .agent_history_aggregate import AggregateFind
         self._aggregate = AggregateFind(AgentHistoryCore(policy, legacy.catalog, legacy, self.key),
                                         self._run, self._abandon)
 
-    def start(self):
+    def start(self, *, monitor_locations=False):
         with self._lock:
             if self._closed:
                 raise _private()
@@ -82,6 +107,37 @@ class AgentHistoryService:
                     self._workspace, self.policy.scratch_identity = _prepare_workspace(self.policy.scratch)
                 except OSError:
                     raise _private() from None
+            if monitor_locations and self.policy.mode == "v2" and self._checkpoint_process is None:
+                context = multiprocessing.get_context("spawn")
+                self._checkpoint_stop, ready = context.Event(), context.Event()
+                process = context.Process(target=_monitor_locations, args=(self.policy.store,
+                    self._checkpoint_stop, ready, CHECKPOINT_SECONDS), name="project-history-locations", daemon=True)
+                process.start()
+                self._checkpoint_process = process
+                if not ready.wait(_CHECKPOINT_BUDGET + 3):
+                    self._stop_monitor()
+                    raise AccessError("The project location observer could not start.", code="history_observer_unavailable")
+
+    def _stop_monitor(self):
+        process = self._checkpoint_process
+        if process is None:
+            return
+        self._checkpoint_stop.set()
+        process.join(_CHECKPOINT_BUDGET * 2 + 1)
+        forced = process.is_alive()
+        if forced:
+            process.terminate()
+            process.join(0.5)
+        if process.is_alive():
+            process.kill()
+            process.join(0.5)
+        if process.is_alive():
+            raise AccessError("Project location observer shutdown is pending.", code="history_observer_shutdown_pending")
+        status = process.exitcode
+        process.close()
+        self._checkpoint_process = self._checkpoint_stop = None
+        if forced or status != 0:
+            raise AccessError("The last project location checkpoint did not finish.", code="history_checkpoint_incomplete")
 
     def caller(self):
         if self.local:
@@ -192,11 +248,15 @@ class AgentHistoryService:
     def close(self):
         with self._lock:
             if self._closed:
+                self._stop_monitor()
                 return
             self._closed = True
+            if self._checkpoint_stop is not None:
+                self._checkpoint_stop.set()
             for slot in self._workers.values():
                 self._close_slot(slot)
             self._workers.clear()
             if self._workspace is not None:
                 os.close(self._workspace)
                 self._workspace = None
+            self._stop_monitor()

@@ -239,12 +239,14 @@ def _paired_steps(compact, full):
         yield index, kind, source, status, record
 
 
-def _project(steps):
+def _project(steps, manifest=None):
     messages = []
     warnings = set()
     saw_expected_message = False
     visible_chars = 0
     for index, kind, source, status, record in steps:
+        if manifest is not None:
+            manifest.append((index, kind, source, status, _timestamp(record.get('created_at'))))
         role = VISIBLE_ROLES.get((kind, source))
         if role is None:
             if source == 'USER_EXPLICIT' or (kind in ('USER_INPUT', 'PLANNER_RESPONSE')
@@ -278,6 +280,7 @@ class Adapter:
         if version is not None and version not in VERSIONS:
             raise _unsupported('Antigravity App version is not supported.')
         self.root = root
+        self.version = version
         self.warnings = ()
 
     def _index(self, connection):
@@ -411,11 +414,14 @@ class Adapter:
             raise _unsupported('Antigravity conversation index schema is not supported.') from None
 
     def snapshot(self, thread):
+        return self._snapshot(thread)
+
+    def _snapshot(self, thread, manifest=None):
         if not _native_id(thread.native_id):
             raise AccessError('Antigravity conversation is unavailable.', code='source_unavailable')
         relative = f'brain/{thread.native_id}/.system_generated/logs/transcript.jsonl'
         with _transcript(self.root, relative) as compact:
-            messages, warnings = _project(compact)
+            messages, warnings = _project(compact, manifest)
         warnings.update(compact.warnings)
         revision = compact.revision
         identity = compact.identity
@@ -435,6 +441,31 @@ class Adapter:
         return Projection(messages=messages, revision=revision, identity=identity,
                           contexts=thread.contexts, ancestors=thread.ancestors, context_complete=False,
                           warnings=tuple(sorted(warnings)), prefix=prefix)
+
+    def inspect_native(self, thread):
+        """Local operator diagnostic. Only the result class, counts and digest are returned."""
+        from .agent_history_antigravity_native import Assessment, EvidenceIssue, capture
+        try:
+            observation, _ = capture(self, thread)
+            return observation
+        except EvidenceIssue as issue:
+            return Assessment('unverified', str(issue))
+        except AccessError as error:
+            return Assessment('unverified', error.code)
+
+    def snapshot_for_inheritance(self, thread):
+        """Only a supported native desktop trajectory can supply complete project evidence."""
+        from .agent_history_antigravity_native import EvidenceIssue, capture
+        try:
+            _, projection = capture(self, thread)
+            return projection
+        except EvidenceIssue as issue:
+            if str(issue) == 'native_capture_changed':
+                raise AccessError('The native history snapshot changed during capture.', code='waiting_source_stable') from None
+        except AccessError as error:
+            if error.code in {'waiting_source_stable', 'resource_exhausted'}:
+                raise
+        raise AccessError('The session\'s complete project association is unverified.', code='association_unverified')
 
     def _recover(self, relative, original):
         companion = relative.removesuffix('transcript.jsonl') + 'transcript_full.jsonl'

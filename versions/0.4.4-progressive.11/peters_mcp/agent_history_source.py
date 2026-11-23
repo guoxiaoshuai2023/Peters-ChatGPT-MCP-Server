@@ -55,6 +55,9 @@ class Projection:
     warnings: tuple[str, ...] = ()
     title: str = ""
     prefix: tuple[str, int, str] | None = None
+    # Earliest native creation time in the verified lineage, never a file mtime.
+    origin_ns: int | None = None
+    last_ns: int | None = None
 
 
 def _unavailable():

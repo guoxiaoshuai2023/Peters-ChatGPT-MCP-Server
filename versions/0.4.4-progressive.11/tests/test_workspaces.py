@@ -13,6 +13,24 @@ from peters_mcp.workspaces import (RepositoryRegistry, repository_pin_v1,
                                     repository_pin_v2, repository_probe)
 
 
+def fixture_git(root, *args):
+    env = {key: value for key, value in os.environ.items() if not key.startswith("GIT_")}
+    env.update(GIT_CONFIG_NOSYSTEM="1", GIT_CONFIG_GLOBAL=os.devnull,
+               GIT_AUTHOR_NAME="Fixture", GIT_AUTHOR_EMAIL="fixture@example.invalid",
+               GIT_COMMITTER_NAME="Fixture", GIT_COMMITTER_EMAIL="fixture@example.invalid")
+    return subprocess.run(["/usr/bin/git", "-C", str(root), *args], check=True,
+                          capture_output=True, text=True, env=env).stdout
+
+
+def fixture_registered_worktree(root, path):
+    root.mkdir(exist_ok=True)
+    fixture_git(root, "init", "-b", "main")
+    fixture_git(root, "commit", "--allow-empty", "-m", "fixture")
+    fixture_git(root, "worktree", "add", "-b", "fixture-side", str(path))
+    return {"id": root.name, "name": root.name, "root": str(root),
+            "repository_id": RepositoryRegistry.identity(root)}
+
+
 def device_drift_fstat(original, delta=17):
     """Model one new runtime device mapping while preserving every other field."""
     def changed(*args, **kwargs):
@@ -35,12 +53,7 @@ class WorkspaceTests(unittest.TestCase):
         self.registry = RepositoryRegistry({"demo": self.project})
 
     def git(self, root, *args):
-        env = {key: value for key, value in os.environ.items() if not key.startswith("GIT_")}
-        env.update(GIT_CONFIG_NOSYSTEM="1", GIT_CONFIG_GLOBAL=os.devnull,
-                   GIT_AUTHOR_NAME="Fixture", GIT_AUTHOR_EMAIL="fixture@example.invalid",
-                   GIT_COMMITTER_NAME="Fixture", GIT_COMMITTER_EMAIL="fixture@example.invalid")
-        return subprocess.run(["/usr/bin/git", "-C", str(root), *args], check=True,
-                              capture_output=True, text=True, env=env).stdout
+        return fixture_git(root, *args)
 
     def init_repo(self, root):
         root.mkdir(parents=True)

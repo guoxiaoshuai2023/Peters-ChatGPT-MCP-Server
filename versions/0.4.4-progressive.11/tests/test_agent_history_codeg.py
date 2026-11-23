@@ -70,11 +70,11 @@ class CodegAdapterTests(unittest.TestCase):
             )
             db.commit()
 
-    def _transcript(self, session, *records, previous=None, cwd=None, agent="custom:goose", version=1):
+    def _transcript(self, session, *records, previous=None, cwd=None, agent="custom:goose", version=1, started=1000):
         path = self.root / "acp-transcripts" / "goose" / (session + ".jsonl")
         path.parent.mkdir(parents=True, exist_ok=True)
         header = {"v": version, "kind": "header", "agent": agent,
-                  "session_id": session, "cwd": str(cwd or self.project), "started_at_ms": 1000}
+                  "session_id": session, "cwd": str(cwd or self.project), "started_at_ms": started}
         if previous is not None:
             header["continues_from"] = previous
         path.write_text("".join(json.dumps(record) + "\n" for record in (header, *records)), encoding="utf-8")
@@ -191,13 +191,14 @@ class CodegAdapterTests(unittest.TestCase):
         self._conversation(2, native="newer")
         old_worktree = self.project / "past"
         old_worktree.mkdir()
-        self._transcript("older", prompt("Old question"), answer("Old answer"), end(), cwd=old_worktree)
+        self._transcript("older", prompt("Old question"), answer("Old answer"), end(), cwd=old_worktree, started=750)
         self._transcript("newer", prompt("New question"), answer("New answer"), end(), previous="older")
         thread = self.adapter.describe("2")
         projection = self.adapter.snapshot(thread)
         self.assertEqual([message.text for message in projection.messages],
                          ["Old question", "Old answer", "New question", "New answer"])
         self.assertIn(str(old_worktree), projection.contexts)
+        self.assertEqual(projection.origin_ns, 750_000_000)
         self.assertEqual(projection.ancestors, ("older", "1"))
         self.assertIsNone(projection.prefix)
         with closing(sqlite3.connect(self.database)) as db:

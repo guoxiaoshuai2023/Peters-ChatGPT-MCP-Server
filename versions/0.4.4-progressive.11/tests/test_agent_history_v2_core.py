@@ -100,6 +100,8 @@ class UnifiedCoreTests(unittest.TestCase):
         self.assertEqual(after["threads"], [])
 
     def test_legacy_exception_is_bound_to_exact_source_cut_and_project_identity(self):
+        self.adapter.supports_inheritance = False
+        self.adapter.snapshot_for_inheritance = lambda _: self.fail("A legacy exception uses the pinned snapshot")
         self.source.threads["thread"] = "main"
         scope = self.scope()
         self.source.exceptions["thread"] = {
@@ -116,6 +118,67 @@ class UnifiedCoreTests(unittest.TestCase):
                 finish(self.core._load(scope, "codeg", "thread"))
             self.assertEqual(denied.exception.code, "association_unverified")
 
+    def test_stronger_native_snapshot_required_on_each_unbound_read(self):
+        self.adapter.supports_inheritance = False
+        self.adapter.snapshot = lambda _: self.fail("Unbound history needs native attribution")
+        scope = self.scope()
+        with self.assertRaises(AccessError) as unavailable:
+            finish(self.core._load(scope, "codeg", "thread"))
+        self.assertEqual(unavailable.exception.code, "association_unverified")
+        self.adapter.snapshot_for_inheritance = lambda _: self.projection
+        record = finish(self.core._load(scope, "codeg", "thread"))
+        self.assertEqual(record.entries[0].text, "Visible question")
+        self.projection = replace(self.projection, contexts=(str(self.foreign),))
+        with self.assertRaises(AccessError) as outside:
+            finish(self.core._load(scope, "codeg", "thread"))
+        self.assertEqual(outside.exception.code, "unauthorized")
+
+    def test_old_reference_cannot_read_a_replacement_or_continue_its_page(self):
+        self.projection = replace(self.projection, messages=(
+            Message("user", "Original question", "seq:1"),
+            Message("assistant", "Original reply", "seq:2")))
+        target = self.find()["threads"][0]["thread_ref"]
+        arguments = dict(thread_ref=target, view="all", turn_id="", cursor="", limit=1, max_chars=200,
+                         actor=self.actor, policy_actor=self.actor)
+        first = finish(self.core._read(**arguments))
+        self.assertTrue(first["has_more"])
+        self.projection = replace(self.projection, identity="replacement", revision="new")
+        with self.assertRaises(AccessError) as stale:
+            finish(self.core._read(**arguments))
+        self.assertEqual(stale.exception.code, "restart_required")
+        arguments["cursor"] = first["next_cursor"]
+        continuation = finish(self.core._read(**arguments))
+        with self.assertRaises(AccessError) as changed:
+            finish(self.core.revalidate_result_iter("read_agent_thread", arguments, continuation))
+        self.assertEqual(changed.exception.code, "restart_required")
+
+    def test_a_metadata_edit_invalidates_prepared_and_cached_read_pages(self):
+        self.projection = replace(self.projection, messages=(
+            Message("user", "Original question", "seq:1"),
+            Message("assistant", "Original reply", "seq:2")))
+        original_thread, original_projection = self.thread, self.projection
+        args = dict(view="all", turn_id="", cursor="", limit=1, max_chars=200,
+                    actor=self.actor, policy_actor=self.actor)
+        for change in ("title", "surface", "updated_at", "warnings"):
+            with self.subTest(change=change):
+                self.thread, self.projection = original_thread, original_projection
+                args["cursor"] = ""
+                args["thread_ref"] = self.find()["threads"][0]["thread_ref"]
+                prepared = finish(self.core._read(**args))
+                if change == "warnings":
+                    self.projection = replace(original_projection, warnings=("missing_steps",))
+                else:
+                    value = "2030-01-01T00:00:00+00:00" if change == "updated_at" else "changed"
+                    self.thread = replace(original_thread, **{change: value})
+                with self.assertRaises(AccessError) as stale:
+                    finish(self.core.revalidate_result_iter("read_agent_thread", args, prepared))
+                self.assertEqual(stale.exception.code, "restart_required")
+                args["cursor"] = prepared["next_cursor"]
+                following = finish(self.core._read(**args))
+                with self.assertRaises(AccessError) as stale:
+                    finish(self.core.revalidate_result_iter("read_agent_thread", args, following))
+                self.assertEqual(stale.exception.code, "restart_required")
+
     def test_source_instance_changes_stable_ids_and_message_namespace(self):
         first = finish(self.core._load(self.scope(), "codeg", "thread"))
         expected = hashlib.sha256(b'["codeg","thread"]').hexdigest()
@@ -125,6 +188,14 @@ class UnifiedCoreTests(unittest.TestCase):
         self.assertNotEqual(first.stable_id, second.stable_id)
         self.assertNotEqual(self.core._message_id(first, first.entries[0]),
                             self.core._message_id(second, second.entries[0]))
+
+    def test_disjoint_project_physical_change_preserves_the_current_scope(self):
+        original = self.scope()
+        self.foreign.rename(self.root / "relocated")
+        after = self.scope()
+        self.assertNotEqual(original.worktrees["foreign"]["fingerprint"],
+                            after.worktrees["foreign"]["fingerprint"])
+        self.assertEqual(original.key, after.key)
 
     def test_codex_is_gated_by_the_same_enabled_source_before_legacy_read(self):
         self.sources["codex"] = SimpleNamespace(enabled=False, allows=lambda actor, project: False)
@@ -151,7 +222,7 @@ class UnifiedCoreTests(unittest.TestCase):
         self.assertEqual(len(page["threads"]), 1)
         self.assertTrue(page["coverage_complete"])
 
-    def alias(self):
+    def alias(self, *, pinned=True):
         old = self.root / "old-project"
         self.source.path_aliases = [{
             "native_project_id": "native-project", "source_instance": self.source.instance_id,
@@ -160,6 +231,11 @@ class UnifiedCoreTests(unittest.TestCase):
         }]
         self.thread = replace(self.thread, contexts=(str(old),), native_project_id="native-project")
         self.projection = replace(self.projection, contexts=(str(old),))
+        if pinned:
+            self.source.threads = {"thread": "main"}
+            self.source.exceptions = {"thread": {"project_id": "main", "source_identity": self.projection.identity,
+                "source_revision": self.projection.revision,
+                "project_fingerprint": self.scope().worktrees["main"]["fingerprint"]}}
         return old
 
     def test_alias_maps_only_the_exact_missing_root_with_matching_native_project(self):
@@ -210,11 +286,21 @@ class UnifiedCoreTests(unittest.TestCase):
             finish(self.core._load(self.scope(), "codeg", "thread"))
 
     def test_alias_never_replaces_the_complete_context_or_exact_snapshot_requirement(self):
-        self.alias()
+        self.alias(pinned=False)
         self.projection = replace(self.projection, context_complete=False)
         with self.assertRaises(AccessError) as denied:
             finish(self.core._load(self.scope(), "codeg", "thread"))
         self.assertEqual(denied.exception.code, "association_unverified")
+
+    def test_unreviewed_thread_at_temporarily_reused_legacy_root_never_inherits(self):
+        old = self.alias(pinned=False)
+        old.mkdir()
+        self.assertEqual(self.find()["threads"], [])
+        old.rmdir()
+        self.assertEqual(self.find()["threads"], [])
+        with self.assertRaises(AccessError) as missing:
+            finish(self.core._load(self.scope(), "codeg", "thread"))
+        self.assertEqual(missing.exception.code, "association_unverified")
 
 
 if __name__ == "__main__":

@@ -226,6 +226,22 @@ def preview_activation(document, *, inputs=(), previous=None):
     return preview, _digest(canonical_bytes(preview))
 
 
+def preview_path_migration(document, source_id, old_root, before, *, inputs=(), previous=None,
+                           native_project=None):
+    from .agent_history_path_migration import reviewed_document
+    target, report = reviewed_document(compile_generation(document), source_id, old_root, before,
+                                       previous=previous[0] if previous else None,
+                                       native_project=native_project)
+    preview, _ = preview_activation(target, inputs=inputs, previous=previous)
+    preview['path_migration'] = report
+    conflicts = [entry for entry in report['pending'] if entry['reason'] == 'previous_approval_drifted']
+    if conflicts:
+        # A stale template may omit the active receipt. Activating that omission
+        # would erase provenance and allow a later retry to silently re-enrol it.
+        preview['unresolved'] = conflicts
+    return preview, _digest(canonical_bytes(preview))
+
+
 def _verified_codex_disposition(access, native, project):
     try:
         config = access._configuration(guard_codex=False)
@@ -393,6 +409,9 @@ def activate_preview(store, preview, expected_preview_digest, *, initial=False, 
     approved = _approved_physical_scope(document)
     if document != preview["document"] or approved != preview["physical_scope"]:
         raise _drift()
+    if "path_migration" in preview:
+        from .agent_history_path_migration import revalidate
+        revalidate(document, preview["path_migration"])
     if preview.get("legacy_input") is not None:
         legacy_path = preview["legacy_input"]
         _, legacy = _input(legacy_path)
@@ -440,7 +459,11 @@ def _recovery_store(descriptor, initial_path):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("operation", choices=("preview", "preview-migration", "approve-scope", "activate", "recover", "show"))
+    parser.add_argument("operation", choices=("preview", "preview-migration", "preview-path-migration",
+                                              "approve-scope", "activate", "recover", "show"))
+    parser.add_argument("--old-root", help="Exact former workspace root of an already configured migration alias")
+    parser.add_argument("--native-project", help="Native project identity when more than one alias shares a former root")
+    parser.add_argument("--before", help="Latest pre-move timestamp eligible for local review, including UTC offset")
     parser.add_argument("--descriptor", type=Path)
     parser.add_argument("--document", type=Path)
     parser.add_argument("--preview", type=Path)
@@ -480,12 +503,19 @@ def main():
         elif arguments.operation == "show":
             document, digest = AgentPolicy(arguments.descriptor, mode="v2").snapshot()
             print(json.dumps({"sha256": digest, "document": document}, ensure_ascii=False, indent=2))
-        elif arguments.operation == "preview":
+        elif arguments.operation in {"preview", "preview-path-migration"}:
             if arguments.document is None:
                 parser.error("preview requires --document")
-            _, document = _input(arguments.document)
+            input_record, document = _input(arguments.document)
             previous = None if arguments.initialize else AgentPolicy(arguments.descriptor, mode="v2").snapshot()
-            preview, digest = preview_activation(document, previous=previous)
+            if arguments.operation == "preview-path-migration":
+                if not arguments.source or not arguments.old_root or not arguments.before:
+                    parser.error("preview-path-migration requires --source, --old-root and --before")
+                preview, digest = preview_path_migration(document, arguments.source, arguments.old_root,
+                                                         arguments.before, inputs=(input_record,), previous=previous,
+                                                         native_project=arguments.native_project)
+            else:
+                preview, digest = preview_activation(document, previous=previous)
             print(json.dumps({"sha256": digest, "preview": preview}, ensure_ascii=False, indent=2))
         else:
             if arguments.preview is None or arguments.preview_sha256 is None:

@@ -6,22 +6,57 @@ Only this module's fixed discovery commands are allowed; no repository scripts,
 index refresh, checkout, worktree repair, or arbitrary Git methods are exposed.
 """
 
-from contextlib import ExitStack
+from contextlib import contextmanager, ExitStack
+from contextvars import ContextVar
+from dataclasses import dataclass
+import errno
 from hashlib import sha256
 import json
 import os
 from pathlib import Path
 import stat
 import subprocess
+import time
 
 from .catalog import AccessError, DIRECTORY_FLAGS, _close_source_fd
-from .fs_identity import persistent_identity_fd, validate_identity
+from .fs_identity import persistent_identity, persistent_identity_fd, validate_identity
+from .history_location import LocationEvidence, merge_windows, owner_key
 
 
 GIT = "/usr/bin/git"
 MAX_GIT_OUTPUT = 2 * 1024 * 1024
 MAX_WORKTREE_REGISTRATIONS = 4096
+_discovery_deadline = ContextVar("peters_discovery_deadline", default=None)
+_validation_observer = ContextVar("peters_history_topology", default=None)
 
+
+def _time_left(maximum):
+    deadline = _discovery_deadline.get()
+    if deadline is None:
+        return maximum
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise AccessError("The physical scope deadline expired.", code="restart_required")
+    return min(maximum, remaining)
+
+
+@contextmanager
+def discovery_deadline(deadline):
+    token = _discovery_deadline.set(deadline)
+    try:
+        yield
+    finally:
+        _discovery_deadline.reset(token)
+
+
+@contextmanager
+def observe_validation_topology(observer):
+    """Each worker task observes only discoveries made by its own validation generator."""
+    token = _validation_observer.set(observer)
+    try:
+        yield
+    finally:
+        _validation_observer.reset(token)
 
 def _digest(value):
     return sha256(json.dumps(value, sort_keys=True, ensure_ascii=True,
@@ -33,6 +68,12 @@ def _git(root, operation):
         "probe": ["rev-parse", "--path-format=absolute", "--git-common-dir",
                   "--show-toplevel", "--absolute-git-dir"],
         "worktrees": ["worktree", "list", "--porcelain", "-z"],
+        # Ask Git for configuration dependencies only. Configuration values for
+        # credentials, remotes and other unrelated settings never enter Python.
+        "includes": ["config", "--includes", "--show-origin", "--null", "--type=path",
+                     "--get-regexp", r"^include(if\..*)?\.path$"],
+        "head-ref": ["symbolic-ref", "--quiet", "--no-recurse", "HEAD"],
+        "resolved-head-ref": ["symbolic-ref", "--quiet", "HEAD"],
     }
     if operation not in commands:
         raise AccessError("Unsupported repository discovery operation.")
@@ -46,7 +87,7 @@ def _git(root, operation):
              f"core.hooksPath={os.devnull}", "-c", "maintenance.auto=false", "-c",
              "gc.auto=0", "-C", str(root), *commands[operation]],
             stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
-            env=env, timeout=5, check=False,
+            env=env, timeout=_time_left(5), check=False,
         )
     except OSError:
         # Popen may fail while closing its temporary descriptors. Its public
@@ -56,6 +97,8 @@ def _git(root, operation):
                           code='source_cleanup_pending') from None
     except subprocess.TimeoutExpired as exc:
         raise AccessError("Repository discovery unavailable or timed out.") from exc
+    if operation in {"includes", "head-ref", "resolved-head-ref"} and result.returncode == 1 and not result.stdout:
+        return ""  # No include declarations, or HEAD is detached.
     if result.returncode or len(result.stdout) > MAX_GIT_OUTPUT:
         raise AccessError("Repository discovery failed or exceeded its output limit.")
     return os.fsdecode(result.stdout)
@@ -240,8 +283,17 @@ def _metadata_probe(top, gitdir, common, handles):
     # result. Re-running a process while all anchors are open would exceed
     # the exporter ticket, and would not strengthen those FD proofs.
     handles.verify()
-    _, root_info = handles.open(top)
+    root_fd, root_info = handles.open(top)
+    # Birth of the physical checkout and common repository bounds their history.
+    # Git rewrites the backlink when a linked checkout is moved to a new path.
+    physical = persistent_identity_fd(root_fd)
+    history_birth = max(identity["birthtime_ns"], physical["birthtime_ns"])
+    if gitdir != common:
+        _, backlink_info = handles.open(gitdir / "gitdir", directory=False)
+        history_birth = max(history_birth, backlink_info.st_ctime_ns)
     return {"root": top, "common": common, "gitdir": gitdir, "common_identity": identity,
+            "history_birth_ns": history_birth,
+            "history_root_identity": physical,
             "root_runtime_identity": [root_info.st_dev, root_info.st_ino],
             "common_runtime_identity": [info.st_dev, info.st_ino],
             "repository_id": _pin_v2(common, identity),
@@ -269,6 +321,7 @@ def registration_stamp(common):
             raise AccessError("Git worktree registration exceeds the bounded proof size.", code="scope_changed")
         markers = []
         for name in names:
+            _time_left(5)
             details = os.stat(name, dir_fd=fd, follow_symlinks=False)
             if not stat.S_ISDIR(details.st_mode):
                 raise AccessError("Git worktree registration entry is not a directory.", code="scope_changed")
@@ -322,10 +375,205 @@ def _records(raw):
     return records
 
 
+def _path_stamp(path):
+    """Metadata only. A directory's ordinary child writes do not change its scope."""
+    try:
+        info = path.lstat()
+        try:
+            canonical = path.resolve() == path
+        except RuntimeError:
+            # A symbolic-link cycle is not a canonical visible worktree.
+            canonical = False
+    except OSError as error:
+        if error.errno in {errno.ENOENT, errno.ENOTDIR, errno.ELOOP}:
+            return ("absent",)
+        raise AccessError("Cannot verify a workspace path.", code="scope_changed") from None
+    stamp = _runtime_identity(info) if stat.S_ISDIR(info.st_mode) else _metadata_identity(info)
+    return (canonical, *stamp)
+
+
+def _control_stamp(path):
+    """Check the file Git would actually open, including a symlink's target."""
+    try:
+        info = path.stat()
+        resolved = str(path.resolve(strict=True))
+    except OSError as error:
+        if error.errno in {errno.ENOENT, errno.ENOTDIR}:
+            return ("absent",)
+        raise AccessError("Cannot verify repository control metadata.", code="scope_changed") from None
+    except RuntimeError:
+        raise AccessError("Cannot resolve repository control metadata.", code="scope_changed") from None
+    if not (stat.S_ISDIR(info.st_mode) or stat.S_ISREG(info.st_mode) or resolved == os.devnull):
+        raise AccessError("Unsupported repository control file type.", code="scope_changed")
+    if stat.S_ISDIR(info.st_mode):
+        return (resolved, *_runtime_identity(info), os.access(path, os.X_OK))
+    return (resolved, *_metadata_identity(info), os.access(path, os.R_OK))
+
+
+def _configuration_inputs(root):
+    raw = _git(root, "includes")
+    if not raw:
+        return set(), False
+    fields = raw.split("\0")
+    if fields.pop() or len(fields) % 2 or len(fields) > 2 * MAX_WORKTREE_REGISTRATIONS:
+        raise AccessError("Unsupported Git configuration dependency list.", code="scope_changed")
+    paths, on_branch = set(), False
+    for origin, setting in zip(fields[::2], fields[1::2]):
+        key, separator, value = setting.partition("\n")
+        name = origin.removeprefix("file:")
+        if (not name or name == origin or not separator or not value or value.startswith(("~", "%("))
+                or any(ord(ch) < 32 for ch in name + value)):
+            raise AccessError("Cannot determine a Git configuration dependency.", code="scope_changed")
+        source = root / name
+        if key.startswith("includeif."):
+            condition = key[len("includeif."):-len(".path")].lower()
+            if condition.startswith("onbranch:"):
+                on_branch = True
+            elif not condition.startswith(("gitdir:", "gitdir/i:", "hasconfig:remote.*.url:")):
+                raise AccessError("Cannot bound this Git include condition.", code="scope_changed")
+        # Retain '..' components: a preceding symlink can change their POSIX meaning.
+        paths.update((source, source.parent / value))
+    return paths, on_branch
+
+
+@dataclass(frozen=True)
+class TopologyReceipt:
+    """Local evidence from the discovery that actually produced a group of fingerprints."""
+    generation: str
+    fingerprints: tuple
+    locations: tuple
+    controls: tuple
+    registrations: tuple
+    complete: bool
+
+    def require_complete(self):
+        if not self.complete:
+            raise AccessError("Physical project scope is unverifiable. Start a fresh request.", code="restart_required")
+
+    def digest_for(self, project_id):
+        self.require_complete()
+        if project_id is None:
+            return _digest(("all", self.fingerprints))
+        fingerprints = dict(self.fingerprints)
+        if project_id not in fingerprints:
+            raise AccessError("Validated project is unavailable.", code="restart_required")
+        return _digest(("project", project_id, fingerprints[project_id]))
+
+    def current(self, snapshot, deadline):
+        if self.generation != snapshot[1] or not self.complete:
+            return False
+        with discovery_deadline(deadline):
+            for path, before in self.locations:
+                _time_left(5)
+                if _path_stamp(path) != before:
+                    return False
+            for path, before in self.controls:
+                _time_left(5)
+                if _control_stamp(path) != before:
+                    return False
+            for common, before in self.registrations:
+                _time_left(5)
+                if registration_stamp(common) != before:
+                    return False
+        return True
+
+
+class _TopologyFacts:
+    def __init__(self):
+        self.locations = {}
+        self.controls = {}
+        self.git_contexts = set()
+        self.registrations = {}
+        self.complete = True
+
+    def location(self, path):
+        stamp = _path_stamp(path)
+        if self.locations.setdefault(path, stamp) != stamp:
+            raise AccessError("Workspace changed during discovery.", code="scope_changed")
+        return stamp
+
+    def watch_root(self, root, *, git):
+        self.location(root)
+        if git:
+            self.location(root / ".git")
+
+    def probe(self, probe):
+        for key in ("root", "gitdir", "common"):
+            self.location(probe[key])
+        if probe["gitdir"] != probe["common"]:
+            self.location(probe["gitdir"] / "gitdir")
+        root, common, gitdir = probe["root"], probe["common"], probe["gitdir"]
+        if root in self.git_contexts:
+            return
+        # These affect repository and worktree recognition. Ordinary objects,
+        # refs and worktree file writes do not change their directory identity.
+        for path in (common / "config", common / "config.worktree", gitdir / "config.worktree",
+                     gitdir / "commondir", gitdir / "HEAD", common / "HEAD",
+                     common / "objects", common / "refs", common / "reftable"):
+            self.control(path)
+        dependencies, on_branch = _configuration_inputs(root)
+        if on_branch:
+            # Ref storage may change the effective branch with an unchanged HEAD.
+            # Do not grant from an indirect ref chain whose dependencies are unknown.
+            for refdir in {common, gitdir}:
+                self.control(refdir / "reftable" / "tables.list")
+            direct = _git(root, "head-ref").rstrip("\n")
+            ultimate = _git(root, "resolved-head-ref").rstrip("\n")
+            if direct != ultimate or (direct and (not direct.startswith("refs/heads/")
+                    or ".." in Path(direct).parts or any(ord(c) < 32 for c in direct))):
+                raise AccessError("Cannot bound the current branch's Git references.", code="scope_changed")
+            if direct:
+                self.control(common / direct)
+                self.control(common / "packed-refs")
+        for path in dependencies:
+            self.control(path)
+        # An included file could have changed before it first became known.
+        # Confirm the dependency closure and Git's actual decision with its
+        # inputs now observed. The final metadata check also catches changes
+        # while Git or another worktree in this same discovery is being read.
+        if dependencies and _configuration_inputs(root) != (dependencies, on_branch):
+            raise AccessError("Git configuration changed during discovery.", code="restart_required")
+        if on_branch and (_git(root, "head-ref").rstrip("\n") != direct
+                          or _git(root, "resolved-head-ref").rstrip("\n") != direct):
+            raise AccessError("Git branch changed during discovery.", code="restart_required")
+        decision = _git(root, "probe").rstrip("\n").split("\n")
+        if decision != list(map(str, (common, root, gitdir))):
+            raise AccessError("Git repository changed during discovery.", code="restart_required")
+        self.git_contexts.add(root)
+
+    def control(self, path):
+        value = _control_stamp(path)
+        if self.controls.setdefault(path, value) != value:
+            raise AccessError("Git control metadata changed during discovery.", code="restart_required")
+
+    def observe_registration(self, common):
+        stamp = registration_stamp(common)
+        if self.registrations.setdefault(common, stamp) != stamp:
+            raise AccessError("Git registration changed during discovery.", code="scope_changed")
+
+    def finish(self, snapshots, generation):
+        for path in self.controls:
+            _time_left(5)
+            self.control(path)
+        fingerprints = tuple(sorted((pid, info["fingerprint"]) for pid, info in snapshots.items()))
+        return TopologyReceipt(generation, fingerprints, tuple(self.locations.items()),
+                               tuple(self.controls.items()), tuple(self.registrations.items()), self.complete)
+
+
+class DiscoveredWorkspaces(dict):
+    """Regular public mapping. Private evidence is excluded from JSON serialization."""
+    def __init__(self, values, topology):
+        super().__init__(values)
+        self.topology = topology
+
+
 class RepositoryRegistry:
     def __init__(self, projects, *, scope_policy=None):
         self.projects = projects
         self.scope_policy = scope_policy
+        self.generation = None
+        self.history_windows = None
+        self.history_store = None
 
     @staticmethod
     def identity(root):
@@ -341,7 +589,7 @@ class RepositoryRegistry:
         return self.projects[project_id]
 
     @staticmethod
-    def _entry(root, default, pin, record=None, forced_state=None, reason=None):
+    def _entry(root, default, pin, record=None, forced_state=None, reason=None, *, facts=None):
         record = record or {}
         root = _clean_path(root)
         branch = record.get("branch")
@@ -362,9 +610,15 @@ class RepositoryRegistry:
                 if not _pin_matches(pin, probe) or probe["root"] != root or record.get("bare"):
                     entry.update(state="identity_mismatch", reason="repository_or_registration_changed")
                 else:
+                    if facts is not None:
+                        try:
+                            facts.probe(probe)
+                        except (OSError, AccessError):
+                            facts.complete = False
+                            raise
                     entry["root_identity"] = probe["root_runtime_identity"]
         except (OSError, RuntimeError, AccessError) as error:
-            if isinstance(error, AccessError) and error.code == 'source_cleanup_pending':
+            if isinstance(error, AccessError) and error.code in {'source_cleanup_pending', 'restart_required'}:
                 raise
             entry.update(state="unavailable", reason="working_directory_or_git_metadata_unavailable")
         return entry
@@ -395,10 +649,12 @@ class RepositoryRegistry:
         return {"project_id": project.id, "repository_id": pin, "mode": mode,
                 "fingerprint": _digest([project.id, pin, mode, sorted(scope)]), "worktrees": entries}
 
-    def _discover(self, project_id):
+    def _discover(self, project_id, facts=None):
         project = self._project(project_id)
         root = _clean_path(project.root)
         pin = getattr(project, "repository_id", None)
+        if facts is not None:
+            facts.watch_root(root, git=pin is not None)
         if pin is None:
             entry = self._entry(root, True, None, forced_state="valid", reason="configured_directory")
             try:
@@ -418,6 +674,8 @@ class RepositoryRegistry:
             return self._snapshot(project, None, "directory", [entry])
         try:
             origin = _probe(root)
+            if facts is not None:
+                facts.probe(origin)
             initial_identity = getattr(project, "registration_identity", None)
             matches_identity = True
             if initial_identity is not None:
@@ -431,14 +689,20 @@ class RepositoryRegistry:
                                     reason="configured_repository_pin_changed")
                 return self._snapshot(project, pin, "repository", [entry])
             common = origin["common"]
-            membership = registration_stamp(common) if self.scope_policy is not None else None
+            if facts is not None:
+                facts.observe_registration(common)
             records = _records(_git(root, "worktrees"))
         except FileNotFoundError:
+            if facts is not None and facts.locations[root] != ("absent",) and facts.locations[root / ".git"] != ("absent",):
+                facts.complete = False
             entry = self._entry(root, True, pin, forced_state="missing", reason="configured_directory_missing")
             return self._snapshot(project, pin, "repository", [entry])
         except (OSError, AccessError) as error:
-            if isinstance(error, AccessError) and error.code == 'source_cleanup_pending':
+            if isinstance(error, AccessError) and error.code in {"source_cleanup_pending", "restart_required"}:
                 raise
+            if facts is not None and facts.locations[root] != ("absent",) and facts.locations[root / ".git"] != ("absent",):
+                # An ambiguous failure cannot prove the absence of external Git registrations.
+                facts.complete = False
             entry = self._entry(root, True, pin, forced_state="unavailable", reason="repository_discovery_unavailable")
             return self._snapshot(project, pin, "repository", [entry])
         entries, roots = [], set()
@@ -450,37 +714,39 @@ class RepositoryRegistry:
             if path in roots:
                 continue
             roots.add(path)
-            entries.append(self._entry(path, path == root, pin, record))
+            if facts is not None:
+                facts.watch_root(path, git=True)
+            entries.append(self._entry(path, path == root, pin, record, facts=facts))
         if root not in roots:
             entries.append(self._entry(root, True, pin, forced_state="identity_mismatch",
                                        reason="configured_directory_not_registered"))
             # A forged/default pointer cannot be used as a gateway to other roots.
             entries = [entry for entry in entries if entry["is_default"]]
         entries.sort(key=lambda entry: (not entry["is_default"], entry["root"]))
-        if self.scope_policy is not None:
-            if registration_stamp(common) != membership:
-                raise AccessError("Git worktree registration changed during discovery.", code="scope_changed")
-            from .project_guard import note_registration
-            note_registration(self.scope_policy, common, membership)
+        if facts is not None:
+            facts.observe_registration(common)
         return self._snapshot(project, pin, "repository", entries)
 
     def discover(self, project_id):
         self._project(project_id)
-        return self.discover_all()[project_id] if self.scope_policy is not None else self._discover(project_id)
-
-    def discover_all(self):
-        snapshots = {project_id: self._discover(project_id) for project_id in self.projects}
         if self.scope_policy is None:
-            return snapshots
+            return self._discover(project_id)
+        snapshots = self.discover_all()
+        snapshots.topology.require_complete()
+        return snapshots[project_id]
+
+    def discover_all(self, *, observe=True):
+        if self.scope_policy is None:
+            return {project_id: self._discover(project_id) for project_id in self.projects}
         from .agent_history_policy import _overlap
-        from .project_guard import note_missing_root
-        for discovery in snapshots.values():
-            for row in discovery["worktrees"]:
-                if row["state"] == "missing":
-                    note_missing_root(self.scope_policy, Path(row["root"]))
+        facts = _TopologyFacts()
+        snapshots = {project_id: self._discover(project_id, facts) for project_id in self.projects}
+        # An existing registered path whose Git probe failed is still a
+        # possible overlap. A transient subprocess failure has no filesystem
+        # marker that could safely witness its continued unavailability.
         extents = {
             project_id: {str(self.projects[project_id].root), *(row["root"] for row in discovery["worktrees"]
-                                                               if row["state"] == "valid")}
+                                                               if row["state"] in {"valid", "unavailable"})}
             for project_id, discovery in snapshots.items()
         }
         for project_id, discovery in snapshots.items():
@@ -494,7 +760,16 @@ class RepositoryRegistry:
                 entries.append(row)
             project = self.projects[project_id]
             snapshots[project_id] = self._snapshot(project, project.repository_id, discovery["mode"], entries)
-        return snapshots
+        receipt = facts.finish(snapshots, self.generation)
+        if observe:
+            from .project_guard import note_discovery
+            note_discovery(self.scope_policy, receipt)
+            observer = _validation_observer.get()
+            if observer is not None:
+                receipt.require_complete()
+                observer(receipt)
+        return DiscoveredWorkspaces(
+            {pid: DiscoveredWorkspaces(info, receipt) for pid, info in snapshots.items()}, receipt)
 
     def resolve(self, project_id, worktree_id=""):
         if not isinstance(worktree_id, str):
@@ -509,15 +784,32 @@ class RepositoryRegistry:
         return entry
 
     def associate(self, cwd, snapshots=None):
-        def result(state, reason, project_id=None, entry=None):
-            return {"state": state, "project_id": project_id,
+        def result(state, reason, project_id=None, entry=None, history_birth=None, identity=None):
+            value = {"state": state, "project_id": project_id,
                     "worktree_id": entry["id"] if entry else None,
                     "root": entry["root"] if entry else None,
                     "repository_id": entry["repository_id"] if entry else None, "reason": reason}
+            if state == "matched" and self.history_store is not None:
+                key = owner_key(entry["root"], identity, entry["repository_id"])
+                current = self.history_store.locations.observe(entry["root"], history_birth, identity)
+                windows = merge_windows((*self.history_windows.get(key, ()), *current))
+                evidence = [LocationEvidence(key, history_birth, windows, self.history_store)]
+                if path != Path(entry["root"]):
+                    # A historical cwd beneath a continuing project may itself
+                    # have been a link to a different project at that time.
+                    child = persistent_identity(path)
+                    birth = child["birthtime_ns"]
+                    span = self.history_store.locations.observe(path, birth, child, within=entry["root"])
+                    child_key = owner_key(path, child, ["cwd", key])
+                    evidence.append(LocationEvidence(child_key, birth, span, self.history_store))
+                value["history_windows"] = tuple(evidence)
+            return value
 
         if not isinstance(cwd, (str, Path)) or not str(cwd):
             return result("pending", "working_directory_missing_from_metadata")
         snapshots = self.discover_all() if snapshots is None else snapshots
+        if isinstance(snapshots, DiscoveredWorkspaces):
+            snapshots.topology.require_complete()
         try:
             path = _directory(cwd)
         except (OSError, AccessError):
@@ -552,7 +844,9 @@ class RepositoryRegistry:
                     if isinstance(error, AccessError) and error.code == "source_cleanup_pending":
                         raise
                     return result("pending", "working_directory_unavailable_or_changed")
-                return result("matched", "verified_configured_directory_subtree", project_id, entry)
+                registration = getattr(self._project(project_id), "registration_identity", None)
+                return result("matched", "verified_configured_directory_subtree", project_id, entry,
+                              registration["birthtime_ns"] if registration else None, registration)
         try:
             probe = _probe(path)
         except (OSError, AccessError) as error:
@@ -589,7 +883,8 @@ class RepositoryRegistry:
             return result("ambiguous", "repository_is_configured_as_multiple_projects")
         if matches:
             project_id, entry = matches[0]
-            return result("matched", "git_identity_and_registered_worktree", project_id, entry)
+            return result("matched", "git_identity_and_registered_worktree", project_id, entry,
+                          probe.get("history_birth_ns"), probe.get("history_root_identity"))
         if authorized_repository:
             return result("pending", "working_directory_not_in_valid_authorized_registration")
         return result("outside", "repository_is_not_authorized")

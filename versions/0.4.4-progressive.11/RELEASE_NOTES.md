@@ -6,9 +6,25 @@ from every enabled source. Project removal invalidates the old project
 generation even if the same root is later added. A confirmed candidate
 can create the default candidate directory using create-only rules.
 
-Antigravity automatic attribution is still a release gate. The read-only
-ledger assessment records evidence gaps and preserves incomplete coverage.
-This snapshot is for development and isolated verification.
+Antigravity Desktop 2.33.0 can automatically associate supported top-level
+local sessions using the saved trajectory, individual step origins and
+execution records. The adapter checks these against the public transcript.
+Unverified sessions retain incomplete coverage. Reviewed historical
+exceptions retain their existing gap warnings.
+
+For directory and worktree grants, v2 checks that the same physical project
+occupied the recorded location throughout the conversation. It uses native
+creation and completion times from the configured history source. When a
+directory moves, the local migration preview can recover reviewed historical
+snapshots. Reusing the former path cannot add later conversations to them.
+
+Background saves, candidate creation, history workers and streamed exports
+carry evidence of the verified Git worktrees through to their commit or
+delivery boundary. This candidate remains in isolated verification.
+
+Unified stdio validates authorization at each bounded kernel write. It
+supports protocol output to a pipe, socket or terminal. The v1 transport
+retains its existing behavior.
 
 # 0.4.4-progressive.9 development candidate
 

@@ -235,6 +235,8 @@ class _TranscriptProjection:
         self.pending_chunks = []
         self.prompt_just_recorded = False
         self.unverified_replay = False
+        self.last_ms = 0
+        self.ordered = True
 
     def _flush(self):
         if self.pending_chunks:
@@ -249,6 +251,8 @@ class _TranscriptProjection:
         kind, raw_time, payload = record.get("k"), record.get("t"), record.get("p")
         if type(raw_time) is not int or raw_time < 0:
             raise _unsupported()
+        self.ordered = self.ordered and raw_time >= self.last_ms
+        self.last_ms = max(self.last_ms, raw_time)
         position = f"acp:{self.session_key}:{line_no}"
         timestamp = _timestamp(raw_time)
         if kind == "prompt":
@@ -349,6 +353,7 @@ def _read_transcript(root, agent, directory, native, budget):
                         or (header.get("continues_from") is not None
                             and not _component(header["continues_from"]))):
                     raise _unsupported()
+                projection.last_ms = header["started_at_ms"]
             else:
                 projection.record(value, line_no)
         if _stamp(stream) != stamp:
@@ -452,6 +457,9 @@ class Adapter:
             tuple(messages), revision, self._digest(identities),
             contexts=tuple(dict.fromkeys(contexts)), ancestors=tuple(dict.fromkeys(ancestors)),
             context_complete=complete, warnings=tuple(sorted(warnings)), prefix=prefix,
+            origin_ns=min(part[0]["started_at_ms"] for part in chain) * 1_000_000,
+            last_ns=(max(part[1].last_ms for part in chain) + 1) * 1_000_000 - 1
+                    if all(part[1].ordered for part in chain) else None,
         )
 
     @staticmethod

@@ -1,7 +1,7 @@
 """MCP tools; the protocol implementation belongs to the official SDK."""
 
 from datetime import datetime, timezone
-from contextlib import asynccontextmanager, contextmanager, nullcontext
+from contextlib import AsyncExitStack, asynccontextmanager, contextmanager, nullcontext
 import asyncio
 import secrets
 import json
@@ -20,6 +20,18 @@ from pydantic import Field
 from .catalog import AccessError, Catalog
 from .candidates import CandidateDelivery
 from .history import FIND_LIMIT_MAX, FIND_LIMIT_MIN, HistoryAccess
+
+
+class _ProjectServer(MCPServer):
+    def __init__(self, *args, project_catalog, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._project_catalog = project_catalog
+
+    async def run_stdio_async(self):
+        if self._project_catalog.unified_policy is None:
+            return await super().run_stdio_async()
+        from .project_stdio import serve_project_stdio
+        await serve_project_stdio(self._lowlevel_server, self._project_catalog)
 
 
 @contextmanager
@@ -95,29 +107,31 @@ def create_server(catalog: Catalog, audit: logging.Logger | None = None, history
         history_service.set_diagnostic_sink(
             lambda event: audit.info(json.dumps({"component": "history_worker", **event}, ensure_ascii=True)))
 
+    async def close_exports():
+        result = await exports.close_lifespan()
+        if audit:
+            audit.info(json.dumps({'component': 'original_export', 'event': 'shutdown', **result}, ensure_ascii=True))
+        if result['state'] != 'stopped':
+            raise RuntimeError('Original export shutdown_pending; actual process exit is required.')
+
     @asynccontextmanager
     async def lifespan(_server):
-        if agent_service is not None:
-            agent_service.start()
-        if exports is not None:
-            await exports.start_lifespan()
-        try:
-            yield {}
-        finally:
-            export_stop = None
-            if exports is not None:
-                export_stop = await exports.close_lifespan()
-                if audit:
-                    audit.info(json.dumps({'component': 'original_export', 'event': 'shutdown',
-                                           **export_stop}, ensure_ascii=True))
-            if files is not None:
-                await asyncio.to_thread(files.close)
-            if agent_service is not None:
-                await asyncio.to_thread(agent_service.close)
+        async with AsyncExitStack() as cleanup:
+            if unified is not None:
+                cleanup.callback(unified.store.locations.close)
             if isinstance(history_service, IsolatedHistory):
-                await asyncio.to_thread(history_service.close)
-            if export_stop is not None and export_stop['state'] != 'stopped':
-                raise RuntimeError('Original export shutdown_pending; actual process exit is required.')
+                cleanup.push_async_callback(asyncio.to_thread, history_service.close)
+            if agent_service is not None:
+                cleanup.push_async_callback(asyncio.to_thread, agent_service.close)
+            if files is not None:
+                cleanup.push_async_callback(asyncio.to_thread, files.close)
+            if exports is not None:
+                cleanup.push_async_callback(close_exports)
+            if agent_service is not None:
+                agent_service.start(monitor_locations=unified is not None)
+            if exports is not None:
+                await exports.start_lifespan()
+            yield {}
     history_tools = {"find_codex_threads", "read_codex_thread", "read_codex_thread_item"}
     agent_tools = {"find_agent_threads", "read_agent_thread"}
     options = dict(server_options or {})
@@ -130,8 +144,9 @@ def create_server(catalog: Catalog, audit: logging.Logger | None = None, history
         options['middleware'] = [export_tools.middleware, *options.get('middleware', ())]
         options['cache_hints'] = {**options.get('cache_hints', {}),
                                  'resources/read': CacheHint(ttl_ms=0, scope='private')}
-    server = MCPServer(
+    server = _ProjectServer(
         "Peters ChatGPT MCP Server",
+        project_catalog=catalog,
         version=("0.4.4-progressive.11" if agent_service is not None else
                  "0.4.4-progressive.1" if exports is not None else
                  "0.4.2-files.1" if files is not None else "0.4.1-history.2"),
@@ -201,23 +216,29 @@ def create_server(catalog: Catalog, audit: logging.Logger | None = None, history
     )
     annotations = ToolAnnotations(readOnlyHint=True, destructiveHint=False,
                                   idempotentHint=True, openWorldHint=False)
-    from .project_guard import commit_project, has_operation_scope, project_token, require_request_epoch
+    from .project_guard import local_tool_scope, project_token, require_request_epoch
     delivery = CandidateDelivery(catalog, trusted_local=agent_local)
 
     def invoke(operation, **arguments):
+        try:
+            with local_tool_scope(catalog):
+                return run_tool(operation, arguments)
+        except AccessError as error:
+            raise ToolError(str(error)) from None
+
+    def run_tool(operation, arguments):
         started = time.monotonic()
         ok = False
         history_error = None
         history_call_id = secrets.token_hex(8) if operation in history_tools | agent_tools else None
         try:
             epoch = None
-            token = None
             project_id = arguments.get("project_id")
             if unified is not None:
                 if history_call_id is not None or operation == "list_projects":
-                    require_request_epoch(catalog)
+                    require_request_epoch(catalog, all_projects=operation == "list_projects")
                 elif project_id:
-                    token = project_token(catalog, project_id)
+                    project_token(catalog, project_id)
             caller = None
             if unified is not None and history_call_id is not None:
                 caller = agent_service.caller()
@@ -262,10 +283,6 @@ def create_server(catalog: Catalog, audit: logging.Logger | None = None, history
                 # policy activation. A stale worker page never leaves this scope.
                 with unified.commit_guard(epoch[1]) as committed:
                     unified.require_actor(caller["policy_actor"], committed)
-                    ok = True
-                    return result
-            if token is not None and not has_operation_scope(unified):
-                with commit_project(catalog, project_id, token):
                     ok = True
                     return result
             ok = True

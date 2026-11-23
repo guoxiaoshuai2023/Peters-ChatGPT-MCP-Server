@@ -73,6 +73,22 @@ def _path(value):
     return path
 
 
+def migration_location_current(alias):
+    """The exact old directory is still absent and its registered target still matches."""
+    from .fs_identity import persistent_identity
+    old = Path(alias["old_root"])
+    try:
+        if old.resolve() != old:
+            return False
+        try:
+            old.lstat()
+        except FileNotFoundError:
+            return persistent_identity(Path(alias["target_root"])) == alias["target_identity"]
+        return False
+    except (AccessError, OSError, RuntimeError):
+        return False
+
+
 def _values(values, *, pattern=None, limit=128):
     if (not isinstance(values, list) or len(values) > limit
             or any(not isinstance(value, str) or not value or len(value) > 200
@@ -147,7 +163,9 @@ def _v2_source(source_id, value):
         raise _bad()
     for native_id, evidence in exceptions.items():
         if (not _matches(IDENTIFIER, native_id) or not isinstance(evidence, dict)
-                or set(evidence) != {"project_id", "source_identity", "source_revision", "project_fingerprint"}
+                or set(evidence) - {"migration_metadata_sha256"} != {"project_id", "source_identity", "source_revision", "project_fingerprint"}
+                or "migration_metadata_sha256" in evidence and (
+                    adapter != "antigravity" or not _matches(_PRINCIPAL, evidence["migration_metadata_sha256"]))
                 or not _matches(IDENTIFIER, evidence["project_id"])
                 or not _matches(IDENTIFIER, evidence["source_identity"])
                 or any(not _matches(_PRINCIPAL, evidence[key]) for key in

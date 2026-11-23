@@ -28,7 +28,7 @@ from .fs_identity import persistent_identity_fd, boot_session_id
 from .file_source import NativeFile, SourceError, receive_file, source_identity
 from .file_targets import FileTargets, FrozenTarget, TargetError, CreatedDirectory
 from .private_roots import _directory
-from .project_guard import commit_project, note_project, project_token
+from .project_guard import WorkspaceChanged, commit_project, note_project, project_token
 from .workspaces import _probe
 
 TERMINAL = frozenset({'completed', 'cancelled', 'failed', 'conflict', 'authorization_blocked',
@@ -591,29 +591,35 @@ class FileSaveService:
                 raise _error('authorization_blocked', 'An observed file-write configuration change blocks this job.') from None
             raise
         target = _target(row)
-        with self.registry.read_guard():
-            try:
-                self.targets.revalidate(target)
-            except TargetError as exc:
-                if exc.permanent:
-                    keys = self._ledger(target)
-                    if (target.project_id not in self.catalog.projects or
-                            self.catalog.projects[target.project_id].repository_id != target.repository_id):
-                        revoked = keys[:1]
-                    elif exc.code in {'protected_path', 'path_excluded', 'special_path_requires_exception',
-                                      'repository_boundary'}:
-                        revoked = keys[2:3]
-                    else:
-                        revoked = keys[1:2]
-                    try:
-                        with self._db_lock, self.db:
-                            for key in revoked:
-                                self.db.execute('UPDATE ledger SET generation=generation+1,valid=0 WHERE key=? AND valid=1', (key,))
-                    except sqlite3.Error:
-                        self._control_failure()
-                        raise _error('metadata_unavailable', 'Authorization observation cannot be committed.') from None
-                    raise _error('authorization_blocked', 'Previously observed permission or target was revoked.') from None
-                raise
+        try:
+            selection = None
+            if self.catalog.unified_policy is not None:
+                selection = self.targets._member(target.project_id, target.worktree_id)
+            with self.registry.read_guard():
+                if selection is not None:
+                    self.targets.revalidate(target, selection=selection)
+                else:
+                    self.targets.revalidate(target)
+        except TargetError as exc:
+            if exc.permanent:
+                keys = self._ledger(target)
+                if (target.project_id not in self.catalog.projects or
+                        self.catalog.projects[target.project_id].repository_id != target.repository_id):
+                    revoked = keys[:1]
+                elif exc.code in {'protected_path', 'path_excluded', 'special_path_requires_exception',
+                                  'repository_boundary'}:
+                    revoked = keys[2:3]
+                else:
+                    revoked = keys[1:2]
+                try:
+                    with self._db_lock, self.db:
+                        for key in revoked:
+                            self.db.execute('UPDATE ledger SET generation=generation+1,valid=0 WHERE key=? AND valid=1', (key,))
+                except sqlite3.Error:
+                    self._control_failure()
+                    raise _error('metadata_unavailable', 'Authorization observation cannot be committed.') from None
+                raise _error('authorization_blocked', 'Previously observed permission or target was revoked.') from None
+            raise
         with self._db_lock:
             for key, version in row['authorization'].items():
                 current = self.db.execute('SELECT generation,valid FROM ledger WHERE key=?', (key,)).fetchone()
@@ -964,6 +970,8 @@ class FileSaveService:
                                 self._put(current)
                                 row['state'] = 'authorization_blocked'
                 for row in rows:
+                    if self._stop.is_set():
+                        return
                     if len(self._active) >= self.max_workers:
                         break
                     if self._quarantined(row):
@@ -1051,6 +1059,8 @@ class FileSaveService:
                 return False
             with self._publish_lock:
                 self._continuation_guard(row, worker=True)
+                if self._stop.is_set():
+                    return False
                 row = self._get(job_id)
                 if row['cancel_requested']:
                     row.update(state='cancelled', cancel_effect='prevented_publish')
@@ -1073,6 +1083,8 @@ class FileSaveService:
                 self._claims[job_id] = {**claim, 'attempt': row['attempt_number'],
                                         'receiver_attempt': handle.ticket['attempt']}
                 self._continuation_guard(row, worker=True)
+            if self._stop.is_set():
+                return False
             source_policy = self._policy()
             with commit_project(self.catalog, row['target']['project_id'], row.get('project_grant')):
                 handle.permit(file, source_policy, row['expected_sha256'], row['expected_size_bytes'])
@@ -1348,12 +1360,13 @@ class FileSaveService:
                     target = self._authorize(current)
                     pending = [CreatedDirectory(item['path'], tuple(item['identity'])) for item in records
                                if item['path'] not in removed]
-                    with self.registry.read_guard():
-                        late_check = self.targets.publication_proof(target)
-                        with commit_project(self.catalog, target.project_id, current.get('project_grant')):
-                            if late_check is not None:
-                                late_check()
-                            removed.update(self.targets.cleanup_created(target, pending))
+                    late_check = self.targets.publication_proof(target)
+                    with commit_project(self.catalog, target.project_id, current.get('project_grant'),
+                                        topology=late_check.roots.topology if late_check else None,
+                                        private_registry=self.registry):
+                        if late_check is not None:
+                            late_check()
+                        removed.update(self.targets.cleanup_created(target, pending, late_check=late_check))
                     directory_state = 'completed' if len(removed) == len(records) else 'retained_or_unverified'
                 except (AccessError, OSError):
                     directory_state = 'retained_scope_unavailable'
@@ -1366,6 +1379,21 @@ class FileSaveService:
             self._put(current)
 
     def _publish(self, row):
+        try:
+            self._publish_once(row)
+        except WorkspaceChanged:
+            # Git may change after mkdir or after the intent was persisted. Reopen
+            # the unchanged grant outside the reservation, at most once. A result
+            # with an uncertain publication syscall must stay in normal recovery.
+            current = self._get(row['job_id'])
+            if current['published'] is False and (not current.get('publish_intent') or current.get('publish_aborted')):
+                self._publish_once(current)
+            elif current['published'] is True and current['durability'] == 'confirmed':
+                self._verify_destination(current)
+            else:
+                raise
+
+    def _publish_once(self, row):
         self._continuation_guard(row, worker=True)
         if not row.get('writer_exited') or not row.get('complete'):
             raise _error('completion_unverifiable', 'Writer exit and complete reception are required.')
@@ -1379,7 +1407,7 @@ class FileSaveService:
                 or row['expected_sha256'] is not None and actual['sha256'] != row['expected_sha256']
                 or row['expected_size_bytes'] is not None and actual['bytes'] != row['expected_size_bytes']):
             raise _error('hash_mismatch', 'Durable complete reception no longer matches its spool.')
-        with self._publish_lock, self.registry.read_guard():
+        with self._publish_lock:
             row = self._get(row['job_id'])
             target = self._continuation_guard(row, worker=True)
             if self._stop.is_set() or self._storage_failed.is_set():
@@ -1393,7 +1421,9 @@ class FileSaveService:
                 self._put(row)
             late_check = self.targets.publication_proof(target)
             with commit_project(
-                    self.catalog, target.project_id, row.get('project_grant')), self.targets.open_parent(
+                    self.catalog, target.project_id, row.get('project_grant'),
+                    topology=late_check.roots.topology if late_check else None,
+                    private_registry=self.registry), self.targets.open_parent(
                     target, create=True, on_created=created, late_check=late_check) as parent:
                 source = _directory(row['attempt_directory'])
                 try:
@@ -1405,7 +1435,7 @@ class FileSaveService:
                         raise _error('file_identity_changed', 'Spool changed before publication.')
                     if late_check is None:
                         self._continuation_guard(row, worker=True)
-                    row.update(state='publishing', publish_intent={'spool_identity': row['spool_identity'],
+                    row.update(state='publishing', publish_aborted=False, publish_intent={'spool_identity': row['spool_identity'],
                                'parent_identity': _identity(os.fstat(parent.fd)), 'receive_complete': _digest(complete)})
                     self._put(row)
                     self._fault('publish_intent', row)
@@ -1449,8 +1479,12 @@ class FileSaveService:
         self._continuation_guard(row, authorize=False, worker=True)
         self._require_job_project(row)
         target = _target(row)
+        late_check = self.targets.publication_proof(target)
         with self.registry.read_guard():
-            self.targets.revalidate(target)
+            if late_check is not None:
+                late_check()
+            else:
+                self.targets.revalidate(target)
             parts = target.path.split('/')
             parent = _directory(Path(target.root).joinpath(*parts[:-1]))
             try:
@@ -1465,17 +1499,25 @@ class FileSaveService:
                     os.close(fd)
             finally:
                 os.close(parent)
-            self.targets.revalidate(target)
+            if late_check is not None:
+                late_check()
+            else:
+                self.targets.revalidate(target)
         if (result['identity'] != row['spool_identity'] or result['bytes'] != row['complete']['bytes']
                 or result['sha256'] != row['complete']['download_sha256']):
             raise _error('target_changed', 'Published file differs from this job; no repair attempted.')
         with self._publish_lock:
             current = self._get(row['job_id'])
             self._continuation_guard(current, authorize=False, worker=True)
-            current.update(state='completed', verification='matched', published=True,
-                           destination_sha256=result['sha256'], verified_at=time.time(), completed_at=time.time())
-            self._put(current)
-            self._fault('completed', current)
+            with commit_project(self.catalog, target.project_id, current.get('project_grant'),
+                                topology=late_check.roots.topology if late_check else None,
+                                private_registry=self.registry if late_check else None):
+                if late_check is not None:
+                    late_check()
+                current.update(state='completed', verification='matched', published=True,
+                               destination_sha256=result['sha256'], verified_at=time.time(), completed_at=time.time())
+                self._put(current)
+                self._fault('completed', current)
 
     def _recover_publication(self, row):
         self._continuation_guard(row, worker=True)
@@ -1485,8 +1527,12 @@ class FileSaveService:
             return
         if row['durability'] != 'confirmed':
             target = self._continuation_guard(row)
-            with self.registry.read_guard(), commit_project(
-                    self.catalog, target.project_id, row.get('project_grant')):
+            late_check = self.targets.publication_proof(target)
+            with commit_project(self.catalog, target.project_id, row.get('project_grant'),
+                                topology=late_check.roots.topology if late_check else None,
+                                private_registry=self.registry):
+                if late_check is not None:
+                    late_check()
                 source = _directory(row['attempt_directory'])
                 parent = _directory(Path(target.destination_display).parent)
                 try:
@@ -1510,6 +1556,12 @@ class FileSaveService:
         self._stop.set()
         if self._thread is not None:
             self._thread.join(max(0, deadline - time.monotonic()))
+        # A coordinator can be inside receiver startup when shutdown starts.
+        # Let it finish registering its durable ticket before collecting handles.
+        while any(not f.done() for f in tuple(self._active.values())) and time.monotonic() < deadline:
+            time.sleep(min(.02, max(0, deadline - time.monotonic())))
+        active = (self._thread is not None and self._thread.is_alive()
+                  or any(not f.done() for f in tuple(self._active.values())))
         pending = []
         for job_id, handle in list(self._handles.items()):
             try:
@@ -1536,9 +1588,6 @@ class FileSaveService:
                     known_exit = False
                 if not known_exit:
                     pending.append(job_id)
-        while any(not f.done() for f in self._active.values()) and time.monotonic() < deadline:
-            time.sleep(.02)
-        active = any(not f.done() for f in self._active.values())
         self._pool.shutdown(wait=False, cancel_futures=True)
         if not active:
             with self._db_lock:

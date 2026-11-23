@@ -373,7 +373,9 @@ class FileExportTools:
                         exchange.response_started = True
 
                 source = lease.record.source
-                async with async_commit_project(self.service.catalog, source.project_id, source.project_grant):
+                topology = lease.roots_proof.topology if lease.roots_proof is not None else None
+                async with async_commit_project(self.service.catalog, source.project_id, source.project_grant,
+                                                topology=topology):
                     if source.project_grant is not None:
                         await asyncio.to_thread(lease.verify_handoff)
                     check_actual_cancellation(lease)

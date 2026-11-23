@@ -30,7 +30,7 @@ class UnifiedToolEvidenceTests(unittest.TestCase):
         home = Path(self.document["legacy_history"]["codex_home"])
         original = home / "sessions" / f"rollout-synthetic-{delivery.THREAD}.jsonl"
         with original.open("ab") as stream:
-            stream.write(encode([_tool(_TOOL_TEXT)]))
+            stream.write(encode([{**_tool(_TOOL_TEXT), "timestamp": delivery.datetime.now(delivery.timezone.utc).isoformat()}]))
         outside = home.parent / "outside"
         outside.mkdir()
         foreign = home / "sessions" / f"rollout-synthetic-{_OUTSIDE}.jsonl"

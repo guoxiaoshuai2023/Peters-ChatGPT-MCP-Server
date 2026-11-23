@@ -23,10 +23,12 @@
     "peters_mcp/agent_history_admin.py",
     "peters_mcp/agent_history_aggregate.py",
     "peters_mcp/agent_history_antigravity.py",
+    "peters_mcp/agent_history_antigravity_native.py",
     "peters_mcp/agent_history_antigravity_shadow.py",
     "peters_mcp/agent_history_codeg.py",
     "peters_mcp/agent_history_deepseek.py",
     "peters_mcp/agent_history_generation.py",
+    "peters_mcp/agent_history_path_migration.py",
     "peters_mcp/agent_history_policy.py",
     "peters_mcp/agent_history_service.py",
     "peters_mcp/agent_history_source.py",
@@ -47,6 +49,7 @@
     "peters_mcp/file_tools.py",
     "peters_mcp/fs_identity.py",
     "peters_mcp/history.py",
+    "peters_mcp/history_location.py",
     "peters_mcp/history_process.py",
     "peters_mcp/history_projection.py",
     "peters_mcp/history_scan.py",
@@ -54,6 +57,7 @@
     "peters_mcp/native_chunk_receiver.py",
     "peters_mcp/private_roots.py",
     "peters_mcp/project_guard.py",
+    "peters_mcp/project_stdio.py",
     "peters_mcp/server.py",
     "peters_mcp/transport_asset.py",
     "peters_mcp/workspaces.py",
@@ -62,7 +66,7 @@
     "requirements.txt",
     "tools/native_receiver_loader.py"
   ],
-  "source_content_fingerprint": "e9138a2c2428d05fe2c02b80ec14086f1fd9ed74ae44297fee42d40583aa4fc4",
-  "candidate_fingerprint": "af3ba048b2bcf232ebe1846ec294c25ffaddec2806136c0671fc038f1fb13801",
-  "rollback_fingerprint": "adcc7a0f089dc21c0f2e4f67aba4a575e9fd2fafb222f7450d534aa4ee3eba25"
+  "source_content_fingerprint": "bc8b0213316d769296ca6f8513fc65cf2eccfbbf416b5d1910b2ab14cb5c7efe",
+  "candidate_fingerprint": "3e2dd9ef3a2bddb18622456403abbf4c04cdf94e82e34f0fb7d7e8599f759676",
+  "rollback_fingerprint": "95fc7806ae9d8a7ac1597d9d99f9ad012d69b0ae799e4fe18d73bca2cd9c6649"
 }

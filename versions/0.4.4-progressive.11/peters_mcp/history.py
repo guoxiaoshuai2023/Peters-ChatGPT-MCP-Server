@@ -17,6 +17,7 @@ import time
 
 from .catalog import AccessError, DIRECTORY_FLAGS, integer
 from .history_projection import project_tool, sanitize
+from .history_location import check_origins
 
 ID_PATTERN = re.compile(r"[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}")
 CURSOR_TTL = 30 * 60
@@ -264,14 +265,39 @@ class HistoryAccess:
             return None, recorded["reason"]
         if config["denied"].intersection(recorded["session_ids"]):
             return None, "copied_ancestor_explicitly_denied"
+        origin = None
+        if config.get("unified"):
+            if recorded["missing_ancestor"]:
+                return None, "association_unverified"
+            native = dict(recorded["origins"])
+            created = row.get("created_at")
+            if type(created) is int and created > 0:
+                # state_5 records seconds. Preserve verified header precision
+                # within that second, otherwise use the earlier native witness.
+                own = native.get(tid)
+                if own is None or own // 1_000_000_000 > created:
+                    native[tid] = created * 1_000_000_000
+            if native and all(type(stamp) is int for stamp in native.values()):
+                origin = min(native.values())
+                if recorded["first_event_ns"] is not None:
+                    origin = min(origin, recorded["first_event_ns"])
         proofs = []
+        witnesses = list(association.get("history_windows", ()))
         for cwd in recorded["contexts"]:
             result = self._associate(config, cwd)
             if result["state"] != "matched" or result["project_id"] != pid:
                 return None, "recorded_context_missing_foreign_or_cross_project"
+            if "history_windows" in result:
+                witnesses.extend(result["history_windows"])
             proofs.append({"cwd": cwd, "worktree_id": result["worktree_id"],
                            "repository_id": result["repository_id"]})
         proof = {"index_cwd": row["cwd"], "contexts": proofs, "project_id": pid}
+        if config.get("unified"):
+            last = recorded["last_event_ns"]
+            if not check_origins(origin, last, witnesses):
+                return None, "association_unverified"
+            proof["origin_ns"] = origin
+            proof["last_ns"] = last
         evidence = config.get("tool_evidence", {}).get(tid, {})
         return {"id": tid, "project_id": pid, "allow_tool_results": evidence.get("allow_tool_results", False),
                 "mcp_tools": evidence.get("mcp_tools", []), **({"label": evidence["label"]} if "label" in evidence else {}),
@@ -552,7 +578,8 @@ class HistoryAccess:
                     and (not projection or reusable_projection)):
                 grant, reason = self._derive(config, row)
                 if not grant or config['denied'].intersection(previous['proof']['session_ids']):
-                    raise AccessError('Thread association changed or was revoked.', code='unverifiable_source')
+                    code = 'association_unverified' if reason == 'association_unverified' else 'unverifiable_source'
+                    raise AccessError('Thread association changed or was revoked.', code=code)
                 if saved and not self._compatible_grant(saved['grant'],grant):
                     raise AccessError('Snapshot association changed.',code='authorization_changed')
                 config['threads'][row['id']] = grant
@@ -560,7 +587,8 @@ class HistoryAccess:
             # Cache admission before allocating a new public projection.
             if projection and len(self._snapshots) >= MAX_SNAPSHOTS:
                 raise AccessError('Active snapshot budget exhausted; retry after expiry or restart.', code='resource_exhausted')
-            current = yield from scan(fd, row['id'], projection=projection, expected=expected, tool_refs=tool_refs)
+            current = yield from scan(fd, row['id'], projection=projection, expected=expected, tool_refs=tool_refs,
+                                      temporal=config.get('unified', False))
         with self._open_rollout(config, row) as fd:
             if stamp(os.fstat(fd)) != current['stamp']:
                 raise AccessError('Source changed during verification; wait for stability.', code='waiting_source_stable')
@@ -589,7 +617,8 @@ class HistoryAccess:
         grant, reason = self._derive(config, row)
         if not grant:
             self._verified.pop(row['id'], None)
-            error = AccessError('Thread is not authorized: source association could not be verified.', code='unverifiable_source')
+            code = 'association_unverified' if reason == 'association_unverified' else 'unverifiable_source'
+            error = AccessError('Thread is not authorized: source association could not be verified.', code=code)
             error.association_reason = reason
             raise error
         if config['denied'].intersection(current['proof']['session_ids']):

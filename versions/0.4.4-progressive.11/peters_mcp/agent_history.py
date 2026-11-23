@@ -368,7 +368,9 @@ class AgentHistoryCore:
         if not grant or grant.get("project_id") != scope.project:
             raise _deny()
         config["threads"][native_id] = grant
-        projection, snapshot = yield from self.legacy.transient_projection_iter(config, row)
+        projection, snapshot, grant = yield from self.legacy.transient_projection_iter(config, row)
+        if grant.get("project_id") != scope.project:
+            raise _deny()
         summary = self.legacy._summary(config, row)
         thread = Thread(native_id, summary["title"], summary["updated_at"] or "", agent="codex", surface="local")
         visible = tuple(Message(item["role"], item["text"], "record:" + str(item["source_line"]),

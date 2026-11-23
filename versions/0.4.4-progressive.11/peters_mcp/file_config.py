@@ -213,8 +213,8 @@ class ConfiguredRegistry:
         return getattr(self.registry, name)
 
     @contextmanager
-    def read_guard(self):
-        with self.registry.read_guard() as guard:
+    def read_guard(self, *, deadline=None):
+        with self.registry.read_guard(deadline=deadline) as guard:
             yield _ConfigGuard(guard, self.config_path)
 
     def check_path(self, path):

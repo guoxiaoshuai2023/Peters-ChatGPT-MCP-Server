@@ -196,6 +196,37 @@ class UnifiedDeliveryTests(unittest.TestCase):
         self.assertFalse(error, second)
         self.assertEqual(second['entries'][0]['text'], SECOND_TEXT)
 
+    def test_append_between_discovery_and_capture_uses_the_captured_grant(self):
+        from peters_mcp.agent_history import AgentHistoryCore
+        from peters_mcp.history import HistoryAccess
+        from tests.test_agent_history_v2_core import finish
+
+        catalog = Catalog.from_policy(self.policy)
+        catalog.set_agent_history_policy(self.policy)
+        core = AgentHistoryCore(self.policy, catalog, HistoryAccess(catalog=catalog, unified_policy=self.policy),
+                                b'fixture-key')
+        # Model a committed native message whose append reaches the reader
+        # between metadata discovery and projection; its clock predates the scope.
+        committed_at = datetime.now(timezone.utc).isoformat()
+        scope = core._configuration('synthetic', 'a' * 64, 'a' * 64)
+        home = Path(self.document['sources']['codex']['root'])
+        path = home / 'sessions' / f'rollout-synthetic-{THREAD}.jsonl'
+        capture = HistoryAccess.transient_projection_iter
+
+        def append_before_capture(reader, config, row):
+            later = {**message('later committed answer', 'assistant', 'final', native_id='later'),
+                     'timestamp': committed_at}
+            with path.open('ab') as stream:
+                stream.write(encode([later]))
+            return (yield from capture(reader, config, row))
+
+        with patch.object(HistoryAccess, 'transient_projection_iter', append_before_capture):
+            first = finish(core._legacy_record(scope, THREAD))
+        second = finish(core._legacy_record(scope, THREAD))
+        self.assertEqual(first.entries[-1].text, 'later committed answer')
+        self.assertEqual(first.projection.last_ns, second.projection.last_ns)
+        self.assertEqual(first.proof, second.proof)
+
     def test_only_returned_migrated_native_hits_require_the_former_root_at_http_delivery(self):
         policy, old = migrated_desktop(self, Path(self.tmp) / 'migration', self.document)
         previous = self.client.app.verifier

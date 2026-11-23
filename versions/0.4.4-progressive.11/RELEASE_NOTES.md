@@ -28,6 +28,9 @@ Each merged result retains its matched sources and their verification.
 Codex projection and linked Codeg records use an operation-local native
 snapshot. Successive project queries keep the existing legacy snapshot
 capacity available for its public page and tool cursors.
+The native snapshot supplies its own verified project grant if a new message
+arrives during discovery. Confirmed candidate saves also pass their commit
+deadline through the configured private-file registry.
 
 Background saves, candidate creation, history workers and streamed exports
 carry evidence of the verified Git worktrees through to their commit or

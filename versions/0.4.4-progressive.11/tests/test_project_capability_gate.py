@@ -22,6 +22,7 @@ from peters_mcp.agent_history_policy import AgentPolicy
 from peters_mcp.candidates import CandidateDelivery, publish_exclusive
 from peters_mcp.catalog import AccessError, Catalog
 from peters_mcp.cloudflare import AccessSettings, build_app
+from peters_mcp.file_config import ConfiguredRegistry
 from peters_mcp.file_context import verified_file_actor
 from peters_mcp.file_targets import FileTargets
 from peters_mcp.project_guard import ProjectResponseGate, _async_reservation, commit_project, local_tool_scope, project_token
@@ -123,6 +124,22 @@ class UnifiedCandidateTests(_ScopeFixture, unittest.TestCase):
         self.assertEqual(self.delivery.save_candidate(**args)["status"], "saved")
         self.assertEqual((self.project / args["path"]).read_bytes(), args["document"].encode())
         self.assertEqual(self.delivery.save_candidate(**args)["status"], "already_saved")
+
+    def test_candidate_save_with_file_service_registry_and_nested_commit_deadline(self):
+        control = self.project.parent / "private-roots"
+        control.mkdir(mode=0o700)
+        private = PrivateRootRegistry(control, allowed_roots=())
+        private.initialize()
+        config_path = self.project.parent / "file-service.json"
+        configured = ConfiguredRegistry(private, config_path)
+        self.catalog.set_private_registry(configured)
+        with configured.read_guard() as guard:
+            with self.assertRaises(AccessError):
+                guard.check_path(config_path)
+            args = self.preview()
+            self.assertEqual(self.delivery.save_candidate(**args)["status"], "saved")
+            self.assertEqual((self.project / args["path"]).read_bytes(), args["document"].encode())
+            self.assertEqual(self.delivery.save_candidate(**args)["status"], "already_saved")
 
     def test_unknown_publish_outcome_allows_exact_verification_without_recreation(self):
         args = self.preview()

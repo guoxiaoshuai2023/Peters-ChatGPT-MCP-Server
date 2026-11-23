@@ -660,8 +660,9 @@ class HistoryAccess:
         try:
             yield from reader._ensure_iter(config, row, projection=True)
             projected, snapshot, _ = reader._snapshot(config, row)
+            grant = reader._snapshots[snapshot['id']]['grant']
             yield from reader._revalidate_iter(config, {row['id']: row}, {row['id']: snapshot})
-            return projected, snapshot
+            return projected, snapshot, grant
         finally:
             # No legacy page or tool reference escapes this operation. Its
             # private storage cannot evict or pin another caller's snapshots.

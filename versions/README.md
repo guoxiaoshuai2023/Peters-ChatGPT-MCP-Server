@@ -1,5 +1,7 @@
 # 独立发布源码快照
 
+统一项目白名单的隔离候选为 [`0.4.4-progressive.9`](0.4.4-progressive.9/AGENT_HISTORY.md)。它预览迁移，统一各已启用来源的项目授权，并将旧 Codex 工具纳入同一授权检查。Antigravity 自动归属仍待验收。构建清单和固定包指纹见 [BUILD_SPEC](0.4.4-progressive.9/BUILD_SPEC.json)。
+
 Antigravity 版本兼容修复快照为 [`0.4.4-progressive.8`](0.4.4-progressive.8/AGENT_HISTORY.md)。Antigravity 来源可以省略 `format`，读取器校验 v3 会话索引、原生日志结构与消息来源，按现有账号、项目和逐线程授权读取。显式配置 `2.32.1` 和 `2.33.0` 仍可用。按[构建清单](0.4.4-progressive.8/BUILD_SPEC.json)可复构以下发布包。
 
 | progressive.8 固定包 | SHA-256 |

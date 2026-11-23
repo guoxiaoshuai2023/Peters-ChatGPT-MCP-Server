@@ -14,7 +14,7 @@ from types import MappingProxyType
 
 from .catalog import AccessError
 from .fs_identity import persistent_identity, validate_identity
-from .history_location import CHECKPOINT_SECONDS, LocationWitnesses, merge_windows, owner_key
+from .history_location import CHECKPOINT_SECONDS, LocationWitnesses, git_metadata_locations, merge_windows, owner_key
 
 MAX_GENERATION_BYTES = 512 * 1024
 MAX_POINTER_BYTES = 64 * 1024
@@ -173,14 +173,22 @@ def _root_history(previous, projects, identities, witnesses, worktrees):
     return history
 
 
-def _registered_checkouts(project):
+def _registered_git_probes(project):
     from .catalog import Catalog
+    from .workspaces import repository_probe
 
     if project.get("repository_id"):
         registry = Catalog._from_document({"projects": [project]}, unified=True).repositories
         for entry in registry.discover(project["id"])["worktrees"]:
-            if entry["state"] == "valid" and not entry["is_default"]:
-                yield entry["root"]
+            if entry["state"] == "valid":
+                try:
+                    proof = repository_probe(entry["root"])
+                except (AccessError, OSError) as error:
+                    if getattr(error, "code", None) == "source_cleanup_pending":
+                        raise
+                    continue
+                if project["repository_id"] in (proof["repository_id"], proof["legacy_repository_id"]):
+                    yield proof, entry["is_default"]
 
 
 def _valid_windows(windows):
@@ -380,10 +388,21 @@ class GenerationStore:
 
     def checkpoint_locations(self, next_project, checkout_indexes, *, deadline, stop=None):
         """Close a bounded round of project observations without opening an agent source."""
-        from .workspaces import discovery_deadline
+        from .history_location import git_metadata_locations
+        from .workspaces import checkpoint_worktree_probe, checkpoint_worktree_records, discovery_deadline
 
         def expired():
             return time.monotonic() >= deadline or (stop is not None and stop.is_set())
+
+        observed = set()
+
+        def checkpoint(root, identity, binding, within=None):
+            key = owner_key(root, identity, binding)
+            if key not in observed and not expired():
+                windows = self.locations.observe(root, identity["birthtime_ns"], identity, within=within)
+                if not expired():
+                    self.retained_location_windows(key, windows, deadline=deadline)
+                    observed.add(key)
 
         snapshot = self.snapshot(deadline=deadline)
         projects = snapshot[0]["projects"]
@@ -403,9 +422,13 @@ class GenerationStore:
             root = project["root"]
             identity = snapshot.project_identities[project["id"]]
             try:
-                self._checkpoint_location(root, identity, pin, deadline)
+                checkpoint(root, identity, pin)
+                if not pin:
+                    continue
                 with discovery_deadline(min(deadline, time.monotonic() + 1.0)):
-                    checkouts = tuple(_registered_checkouts(project))
+                    anchor, checkouts = checkpoint_worktree_records(root, pin, identity)
+                for location in git_metadata_locations(anchor, pin):
+                    checkpoint(*location)
             except (AccessError, OSError):
                 continue
             if checkouts:
@@ -413,19 +436,18 @@ class GenerationStore:
                 for _ in range(min(len(checkouts), 8)):
                     if expired():
                         break
-                    checkout = checkouts[index]
+                    record = checkouts[index]
                     index = (index + 1) % len(checkouts)
                     checkout_indexes[project["id"]] = index
                     try:
-                        self._checkpoint_location(checkout, persistent_identity(checkout), pin, deadline)
+                        with discovery_deadline(min(deadline, time.monotonic() + 1.0)):
+                            probe = checkpoint_worktree_probe(anchor, pin, record)
+                        checkpoint(probe["root"], probe["history_root_identity"], pin)
+                        for location in git_metadata_locations(probe, pin):
+                            checkpoint(*location)
                     except (AccessError, OSError):
                         continue
         return next_project
-
-    def _checkpoint_location(self, root, identity, pin, deadline):
-        now = self.locations.observe(root, identity["birthtime_ns"], identity)
-        if time.monotonic() < deadline:
-            self.retained_location_windows(owner_key(root, identity, pin), now, deadline=deadline)
 
     def _load(self, directory):
         with self._parent() as parent:
@@ -501,8 +523,24 @@ class GenerationStore:
         # Discover external Git checkouts outside the activation lock. A
         # saved interval is usable only for this physical checkout, pin and
         # current native registration, which are rechecked on each read.
-        worktrees = [(checkout, row["repository_id"], persistent_identity(checkout))
-                     for row in document["projects"] for checkout in _registered_checkouts(row)]
+        worktrees, observed = [], set()
+        for row in document["projects"]:
+            for probe, default in _registered_git_probes(row):
+                pin = row["repository_id"]
+                if not default:
+                    worktrees.append((str(probe["root"]), pin, probe["history_root_identity"]))
+                for path, identity, owner, within in git_metadata_locations(probe, pin):
+                    key = owner_key(path, identity, owner)
+                    if key in observed:
+                        continue
+                    try:
+                        windows = self.locations.observe(path, identity["birthtime_ns"], identity, within=within)
+                        self.retained_location_windows(key, windows)
+                    except (AccessError, OSError):
+                        # An optional history observation cannot block revoking
+                        # another project. Actual admission still verifies each fact.
+                        continue
+                    observed.add(key)
         with self.locked(exclusive=True) as directory, self._parent() as parent:
             current = None
             if initial:

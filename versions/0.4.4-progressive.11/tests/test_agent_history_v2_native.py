@@ -19,6 +19,7 @@ from peters_mcp.agent_history_service import AgentHistoryService
 from peters_mcp.catalog import AccessError, Catalog
 from peters_mcp.history import HistoryAccess
 from tests.test_workspaces import fixture_git, fixture_registered_worktree
+from peters_mcp.workspaces import repository_pin_v2
 
 import test_agent_history_codeg as codeg
 import test_agent_history_deepseek as deepseek
@@ -88,6 +89,55 @@ class UnifiedNativeHistoryTests(unittest.TestCase):
     def search(self, project="main", query=""):
         return self.operation("find_agent_threads", project_id=project, query=query,
                               agent="", source_id="codeg", cursor="", limit=10)
+
+    def record_codeg_session(self, index, cwd):
+        with closing(sqlite3.connect(self.source / "codeg.db")) as db:
+            db.execute("UPDATE folder SET path=? WHERE id=?", (str(cwd), index))
+            db.commit()
+        transcript = self.source / f"acp-transcripts/goose/session-{index}.jsonl"
+        rows = [json.loads(line) for line in transcript.read_text().splitlines()]
+        time.sleep(.004)  # The native format records time in milliseconds.
+        stamp = time.time_ns() // 1_000_000
+        rows[0].update(cwd=str(cwd), started_at_ms=stamp)
+        for entry in rows[1:]:
+            entry["t"] = stamp
+        transcript.write_text("".join(json.dumps(entry) + "\n" for entry in rows))
+
+    def test_replacing_git_repository_inside_unchanged_root_excludes_earlier_history(self):
+        for repo in (self.project, self.second):
+            fixture_git(repo, "init", "-q")
+        old_pin = repository_pin_v2(self.project)
+        project = {"id": "history", "name": "History", "root": str(self.project), "repository_id": old_pin}
+        original = compile_generation({**self.document, "projects": [project]})
+        revision = self.store.activate(original, expected_digest=self.epoch)
+        self.record_codeg_session(1, self.project)
+        first = self.search("history")
+        self.assertEqual([row["title"] for row in first["threads"]], ["Visible session 1"])
+        (self.project / ".git").rename(self.root / "archived-metadata")
+        (self.second / ".git").rename(self.project / ".git")
+        new_pin = repository_pin_v2(self.project)
+        self.assertNotEqual(new_pin, old_pin)
+        replacement = compile_generation({**original, "projects": [{**project, "repository_id": new_pin}]})
+        self.store.activate(replacement, expected_digest=revision)
+        self.record_codeg_session(2, self.project)
+        result = self.search("history")
+        self.assertEqual([r["title"] for r in result["threads"]], ["Visible session 2"])
+        self.assertEqual(result["coverage"][0]["state"], "association_unverified")
+        self.assertNotIn("Visible session 1", str(result))
+
+    def test_linked_checkout_needs_its_dotgit_pointer_at_the_time_of_the_native_session(self):
+        repo, side = self.root / "git-root", self.root / "git-side"
+        project = fixture_registered_worktree(repo, side)
+        self.store.activate(compile_generation({**self.document, "projects": [project]}), expected_digest=self.epoch)
+        pointer = side / ".git"
+        registered = pointer.read_bytes()
+        pointer.write_text("gitdir: unavailable-during-the-session\n")
+        self.record_codeg_session(1, side)
+        pointer.write_bytes(registered)
+        self.record_codeg_session(2, side)
+        result = self.search(project["id"])
+        self.assertEqual([r["title"] for r in result["threads"]], ["Visible session 2"])
+        self.assertEqual(result["coverage"][0]["state"], "association_unverified")
 
     def test_reauthorizing_same_directory_restores_history_but_reusing_path_does_not(self):
         # Both directories exist before the recorded session. Birth time alone
@@ -288,7 +338,9 @@ class UnifiedNativeHistoryTests(unittest.TestCase):
             service.start(monitor_locations=True)
         after_first_round = time.time_ns()
         pin = document["projects"][1]["repository_id"]
-        locations = [(self.project, None), (repo, pin), (checkout, pin)]
+        locations = [(self.project, None), (repo, pin), (checkout, pin),
+                     (repo / ".git", ["git-common", pin]),
+                     (repo / ".git" / "worktrees" / checkout.name, ["git-worktree", pin])]
         keys = [owner_key(root, persistent_identity(root), repository) for root, repository in locations]
         confirmed = set()
         limit = time.monotonic() + 4
@@ -303,6 +355,34 @@ class UnifiedNativeHistoryTests(unittest.TestCase):
         self.assertEqual(confirmed, set(keys))
         service.close()
         self.assertIsNone(service._checkpoint_process)
+
+    def test_checkpoint_selects_a_page_before_probing_registered_worktrees(self):
+        from peters_mcp import workspaces
+
+        repo, first = self.root / "paged-repo", self.root / "side-00"
+        row = fixture_registered_worktree(repo, first)
+        all_checkouts = {first}
+        for number in range(1, 12):
+            side = self.root / f"side-{number:02}"
+            fixture_git(repo, "worktree", "add", "--no-checkout", "--detach", str(side))
+            all_checkouts.add(side)
+        document = compile_generation({**self.document, "projects": [row]})
+        self.store.activate(document, expected_digest=self.epoch)
+        offsets = {}
+        previous = set()
+        for target in (8, 12):
+            with patch.object(workspaces, "_probe", wraps=workspaces._probe) as probe:
+                self.store.checkpoint_locations(0, offsets, deadline=time.monotonic() + 4)
+            checked = {Path(call.args[0]) for call in probe.call_args_list} & all_checkouts
+            self.assertEqual(len(checked), 8)
+            previous.update(checked)
+            self.assertEqual(len(previous), target)
+        pin = document["projects"][0]["repository_id"]
+        anchor, records = workspaces.checkpoint_worktree_records(repo, pin, self.store.snapshot().project_identities[row["id"]])
+        moved = next(item for item in records if Path(item["worktree"]) == first)
+        fixture_git(repo, "worktree", "move", str(first), str(self.root / "new-checkout-name"))
+        with self.assertRaises((AccessError, OSError)):
+            workspaces.checkpoint_worktree_probe(anchor, pin, moved)
 
     def test_server_releases_location_observers_when_another_component_fails(self):
         import asyncio

@@ -13,7 +13,7 @@ import threading
 import time
 
 from .catalog import AccessError
-from .fs_identity import persistent_identity_fd
+from .fs_identity import persistent_identity, persistent_identity_fd
 
 
 CHECKPOINT_SECONDS = 30
@@ -23,6 +23,16 @@ def owner_key(root, identity, repository_id):
     data = json.dumps([str(root), identity, repository_id], ensure_ascii=False, sort_keys=True,
                       separators=(",", ":")).encode()
     return sha256(data).hexdigest()
+
+
+def git_metadata_locations(probe, pin):
+    """Named directories that tie this checkout to the same Git repository over time."""
+    common, gitdir = probe["common"], probe["gitdir"]
+    if common.parent != probe["root"]:
+        yield common.parent, persistent_identity(common.parent), pin, None
+    yield common, probe["common_identity"], ["git-common", pin], common.parent
+    if gitdir != common:
+        yield gitdir, persistent_identity(gitdir), ["git-worktree", pin], common
 
 
 def merge_windows(windows):

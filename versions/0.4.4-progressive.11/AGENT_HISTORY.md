@@ -53,8 +53,11 @@ edge starts with the observed mount or a previously retained interval.
 For a session started in a subdirectory the full recorded working directory
 must also be verified over that interval, including each component below the
 registered project or linked Git checkout.
-Git checkouts also require the common repository identity and current worktree
-registration. The store retains verified time intervals for each physical
+Git checkouts also require the same common Git directory at its registered
+location throughout the conversation. A linked checkout includes its own
+administration directory and the three verified pointer files connecting it
+to that repository. This distinguishes different Git repositories that have
+occupied the same working directory. The store retains verified time intervals for each physical
 project and location, including across revocation and restart.
 
 The running v2 MCP service also checkpoints registered roots and discovered

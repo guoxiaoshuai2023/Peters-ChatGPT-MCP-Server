@@ -20,7 +20,7 @@ import time
 
 from .catalog import AccessError, DIRECTORY_FLAGS, _close_source_fd
 from .fs_identity import persistent_identity, persistent_identity_fd, validate_identity
-from .history_location import LocationEvidence, merge_windows, owner_key
+from .history_location import LocationEvidence, git_metadata_locations, merge_windows, owner_key
 
 
 GIT = "/usr/bin/git"
@@ -285,12 +285,14 @@ def _metadata_probe(top, gitdir, common, handles):
     handles.verify()
     root_fd, root_info = handles.open(top)
     # Birth of the physical checkout and common repository bounds their history.
-    # Git rewrites the backlink when a linked checkout is moved to a new path.
+    # A linked checkout can change its repository through any of these three
+    # small pointer files. Their current contents are proved only since their
+    # last metadata change. Regular Git commits do not rewrite them.
     physical = persistent_identity_fd(root_fd)
     history_birth = max(identity["birthtime_ns"], physical["birthtime_ns"])
     if gitdir != common:
-        _, backlink_info = handles.open(gitdir / "gitdir", directory=False)
-        history_birth = max(history_birth, backlink_info.st_ctime_ns)
+        history_birth = max(history_birth, *(handles.proofs[name][1].st_ctime_ns for name in
+                                            (dotgit, gitdir / "gitdir", gitdir / "commondir")))
     return {"root": top, "common": common, "gitdir": gitdir, "common_identity": identity,
             "history_birth_ns": history_birth,
             "history_root_identity": physical,
@@ -306,6 +308,37 @@ def revalidate_repository_probe(probe):
         current = _metadata_probe(probe["root"], probe["gitdir"], probe["common"], _ProbeHandles(stack))
     if current != probe:
         raise AccessError("Verified repository identity changed.", code="scope_changed")
+
+
+def checkpoint_worktree_records(root, pin, registration_identity):
+    """List candidate names once. Each selected member still needs its own Git proof."""
+    root = _directory(root)
+    anchor = _probe(root)
+    if (anchor["root"] != root or not _pin_matches(pin, anchor)
+            or anchor["history_root_identity"] != registration_identity):
+        raise AccessError("The configured Git checkout identity changed.", code="scope_changed")
+    candidates = {}
+    for record in _records(_git(root, "worktrees")):
+        try:
+            path = _clean_path(record["worktree"])
+        except (AccessError, TypeError):
+            continue
+        if not record.get("bare"):
+            candidates.setdefault(path, record)
+    if root not in candidates:
+        raise AccessError("The configured Git checkout is no longer registered.", code="scope_changed")
+    del candidates[root]
+    return anchor, tuple(candidates[path] for path in sorted(candidates))
+
+
+def checkpoint_worktree_probe(anchor, pin, record):
+    path = _clean_path(record["worktree"])
+    probe = _probe(path)
+    if (probe["root"] != path or not _pin_matches(pin, probe) or record.get("bare")
+            or probe["common"] != anchor["common"] or probe["common_identity"] != anchor["common_identity"]):
+        raise AccessError("The selected Git checkout identity changed.", code="scope_changed")
+    revalidate_repository_probe(anchor)
+    return probe
 
 
 def registration_stamp(common):
@@ -784,7 +817,7 @@ class RepositoryRegistry:
         return entry
 
     def associate(self, cwd, snapshots=None):
-        def result(state, reason, project_id=None, entry=None, history_birth=None, identity=None):
+        def result(state, reason, project_id=None, entry=None, history_birth=None, identity=None, git=None):
             value = {"state": state, "project_id": project_id,
                     "worktree_id": entry["id"] if entry else None,
                     "root": entry["root"] if entry else None,
@@ -794,6 +827,13 @@ class RepositoryRegistry:
                 current = self.history_store.locations.observe(entry["root"], history_birth, identity)
                 windows = merge_windows((*self.history_windows.get(key, ()), *current))
                 evidence = [LocationEvidence(key, history_birth, windows, self.history_store)]
+                if git is not None:
+                    for directory, physical, owner, within in git_metadata_locations(git, entry["repository_id"]):
+                        meta_key = owner_key(directory, physical, owner)
+                        birth = physical["birthtime_ns"]
+                        fresh = self.history_store.locations.observe(directory, birth, physical, within=within)
+                        known = merge_windows((*self.history_windows.get(meta_key, ()), *fresh))
+                        evidence.append(LocationEvidence(meta_key, birth, known, self.history_store))
                 if path != Path(entry["root"]):
                     # A historical cwd beneath a continuing project may itself
                     # have been a link to a different project at that time.
@@ -884,7 +924,7 @@ class RepositoryRegistry:
         if matches:
             project_id, entry = matches[0]
             return result("matched", "git_identity_and_registered_worktree", project_id, entry,
-                          probe.get("history_birth_ns"), probe.get("history_root_identity"))
+                          probe["history_birth_ns"], probe["history_root_identity"], probe)
         if authorized_repository:
             return result("pending", "working_directory_not_in_valid_authorized_registration")
         return result("outside", "repository_is_not_authorized")

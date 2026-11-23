@@ -17,6 +17,10 @@ occupied the recorded location throughout the conversation. It uses native
 creation and completion times from the configured history source. When a
 directory moves, the local migration preview can recover reviewed historical
 snapshots. Reusing the former path cannot add later conversations to them.
+Git attribution covers both the working directory and its repository
+metadata. A newly registered repository in an existing working directory
+can expose verified sessions begun under that repository. Background
+observations rotate through bounded sets of registered worktrees.
 
 Background saves, candidate creation, history workers and streamed exports
 carry evidence of the verified Git worktrees through to their commit or

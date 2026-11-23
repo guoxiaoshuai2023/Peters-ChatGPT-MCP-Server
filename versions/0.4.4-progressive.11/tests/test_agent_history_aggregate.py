@@ -4,6 +4,7 @@ import hashlib
 import json
 from types import SimpleNamespace
 import unittest
+from unittest.mock import patch
 
 from peters_mcp.agent_history import AgentHistoryCore
 from peters_mcp.agent_history_aggregate import AggregateFind
@@ -131,6 +132,212 @@ class AggregateFindTests(unittest.TestCase):
         self.assertEqual(validated, [healthy["vouchers"]])
         self.assertEqual(page["coverage"][0]["warnings"], ["processing_timeout"])
         self.assertFalse(page["has_more"])
+
+    def test_admission_wait_has_its_own_deadline(self):
+        clock, calls = [0.0], {}
+
+        def runner(source, operation, cursor, arguments):
+            if operation == "validate_agent_hits":
+                return {"status": "ready"}
+            calls[source] = calls.get(source, 0) + 1
+            clock[0] += 0.5
+            if source == "blocked" or calls[source] <= 8:
+                return {"status": "busy"}
+            return scan(source, hit(source, source, ""))
+
+        with patch("peters_mcp.agent_history_aggregate.time.monotonic", side_effect=lambda: clock[0]):
+            broker = AggregateFind(FixtureCore(("waiting", "blocked")), runner)
+            cursor = ""
+            for _ in range(70):
+                page = broker.find("fixture", "", "", cursor, 10, _ACTOR)
+                if page["status"] == "ready":
+                    break
+                cursor = page["next_cursor"]
+            self.assertEqual(page["status"], "ready")
+        self.assertEqual([row["title"] for row in page["threads"]], ["waiting"])
+        self.assertEqual([row["warnings"] for row in page["coverage"]], [[], ["busy"]])
+
+    def test_queued_sources_inherit_no_wait_from_their_own_admitted_scans(self):
+        routes = ("a", "b", "c", "d")
+        clock, active = [0.0], {}
+
+        def runner(source, operation, cursor, arguments):
+            if operation == "validate_agent_hits":
+                return {"status": "ready"}
+            if source not in active and len(active) == 2:
+                return {"status": "busy"}
+            active[source] = active.get(source, 0) + 1
+            if source in routes[:2] and active[source] < 6:
+                clock[0] += 4
+                return {"status": "processing", "next_cursor": source}
+            active.pop(source)
+            return scan(source, hit(source, source, ""))
+
+        with patch("peters_mcp.agent_history_aggregate.time.monotonic", side_effect=lambda: clock[0]):
+            page = self._ready(AggregateFind(FixtureCore(routes), runner))
+        self.assertTrue(page["coverage_complete"])
+        self.assertEqual({row["title"] for row in page["threads"]}, set(routes))
+
+    def test_indivisible_multi_source_hit_completes_or_reports_its_bound(self):
+        routes = ("codeg-a", "codeg-b", "harness")
+        for cost, exhausted in ((4.0, False), (10.0, True)):
+            with self.subTest(cost=cost):
+                clock, steps, owners, released = [0.0], {}, set(), []
+
+                def runner(source, operation, cursor, arguments):
+                    owners.add(arguments["search_key"])
+                    row = hit(source, source, "2", logical_id="shared", primary=source == "harness")
+                    if operation == "scan_agent_source":
+                        return scan(source, row, hit(source, "next", "1")) if source == "harness" else scan(source, row)
+                    if json.loads(arguments["vouchers"])[0][1] == "next":
+                        return {"status": "ready"}
+                    steps[source] = steps.get(source, 0) + 1
+                    if source != "codeg-a" and steps[source] < 3:
+                        clock[0] += cost
+                        return {"status": "processing", "next_cursor": source}
+                    return {"status": "ready"}
+
+                with patch("peters_mcp.agent_history_aggregate.time.monotonic", side_effect=lambda: clock[0]):
+                    broker = AggregateFind(FixtureCore(routes), runner, lambda s, c: released.append((s, c)))
+                    first = self._ready(broker, limit=1)
+                    self.assertEqual(first["coverage_complete"], not exhausted)
+                    if exhausted:
+                        self.assertEqual(first["threads"], [])
+                        self.assertTrue(all(r["warnings"] == ["resource_exhausted"] for r in first["coverage"]))
+                        self.assertEqual(released, [("harness", "harness")])
+                    else:
+                        row, = first["threads"]
+                        self.assertEqual(row["matched_sources"], list(routes))
+                    self.assertTrue(first["has_more"])
+                    second = self._ready(broker, first["next_cursor"], limit=1)
+                self.assertEqual([row["title"] for row in second["threads"]], ["next"])
+                self.assertFalse(second["has_more"])
+                self.assertEqual(len(owners), 1)
+
+    def test_aborted_and_evicted_searches_release_only_their_own_demands(self):
+        owners, releases = [], []
+
+        def runner(source, operation, cursor, arguments):
+            owner = arguments["search_key"]
+            if source == "first":
+                owners.append(owner)
+                return {"status": "processing", "next_cursor": owner}
+            raise AccessError("Permission was withdrawn.", code="unauthorized")
+
+        broker = AggregateFind(FixtureCore(("first", "revoked")), runner, lambda s, c: releases.append(c))
+        first = broker.find("fixture", "", "", "", 10, _ACTOR)
+        with self.assertRaises(AccessError):
+            broker.find("fixture", "", "", first["next_cursor"], 10, _ACTOR)
+        self.assertEqual(releases, owners)
+        for _ in range(13):
+            broker.find("fixture", "", "", "", 10, _ACTOR)
+        self.assertEqual(len(set(owners)), 14)
+        self.assertEqual(releases, owners[:2])
+
+    def test_exhausted_indivisible_row_releases_the_last_rotated_cursor(self):
+        issued, released = [], []
+
+        def runner(source, operation, cursor, arguments):
+            if operation == "scan_agent_source":
+                return scan(source, hit(source, "slow", ""))
+            issued.append(str(len(issued) + 1))
+            return {"status": "processing", "next_cursor": issued[-1]}
+
+        broker = AggregateFind(FixtureCore(("source",)), runner, lambda s, c: released.append(c))
+        page = self._ready(broker)
+        self.assertFalse(page["coverage_complete"])
+        self.assertEqual(page["threads"], [])
+        self.assertEqual(released, [issued[-1]])
+
+    def test_slow_merged_row_on_later_page_keeps_next_page_reachable(self):
+        routes = ("a", "b", "c", "d")
+        for tail_cost, omitted in ((0, False), (16, True)):
+            with self.subTest(tail_cost=tail_cost):
+                clock, polls = [0.0], [0]
+
+                def runner(source, operation, cursor, arguments):
+                    if operation == "scan_agent_source":
+                        shared = hit(source, source, "2", logical_id="merged", primary=source == "c")
+                        extras = (hit(source, "first", "3"), hit(source, "last", "1")) if source == "c" else ()
+                        return scan(source, shared, *extras)
+                    native = json.loads(arguments["vouchers"])[0][1]
+                    if native == "c":
+                        polls[0] += 1
+                        if polls[0] < 7:
+                            clock[0] += 4
+                            return {"status": "processing", "next_cursor": "held"}
+                        clock[0] += 1
+                    if native == "d":
+                        clock[0] += tail_cost  # Final host-side ownership check.
+                    return {"status": "ready"}
+
+                with patch("peters_mcp.agent_history_aggregate.time.monotonic", side_effect=lambda: clock[0]):
+                    broker = AggregateFind(FixtureCore(routes), runner)
+                    first = self._ready(broker, limit=1)
+                    middle = self._ready(broker, first["next_cursor"], limit=1)
+                    last = self._ready(broker, middle["next_cursor"], limit=1)
+                self.assertEqual(first["threads"][0]["title"], "first")
+                self.assertEqual(middle["coverage_complete"], not omitted)
+                if omitted:
+                    self.assertEqual(middle["threads"], [])
+                    self.assertTrue(all("resource_exhausted" in item["warnings"] for item in middle["coverage"]))
+                else:
+                    self.assertEqual(middle["threads"][0]["matched_sources"], list(routes))
+                self.assertEqual(last["threads"][0]["title"], "last")
+                self.assertFalse(last["has_more"])
+
+    def test_slow_validation_preserves_all_matches_and_rechecks_each_returned_page(self):
+        # A worker can deliver only to a live demand. A late poll must reload
+        # its evidence; an immediate continuation can join the current check.
+        routes = ("ag", "codeg", "codex", "harness")
+        rows = {source: [hit(source, source + str(i), str(99 - i)) for i in range(5)]
+                for source in routes}
+        rows["codeg"][0] = hit("codeg", "alias", "99", logical_id="harness0", primary=False)
+        pending, clock, attested = {}, [0.0], set()
+
+        def runner(source, operation, cursor, arguments):
+            if operation == "scan_agent_source":
+                return scan(source, *rows[source])
+            vouchers = [tuple(item) for item in json.loads(arguments["vouchers"])]
+            key = (source, tuple(vouchers))
+            duration = len(vouchers) * {"ag": .4, "codeg": 1.1, "codex": 2.8, "harness": .5}[source]
+            if not cursor or pending.get(key, 0) <= clock[0]:
+                pending[key] = clock[0] + duration
+            if pending[key] - clock[0] > 4:
+                clock[0] += 4
+                return {"status": "processing", "next_cursor": source + "-pending"}
+            clock[0] = pending.pop(key)
+            attested.update(vouchers)
+            return {"status": "ready"}
+
+        with patch("peters_mcp.agent_history_aggregate.time.monotonic", side_effect=lambda: clock[0]):
+            broker = AggregateFind(FixtureCore(routes), runner)
+            cursor, delivered, sizes = "", [], []
+            for _ in range(100):
+                attested.clear()
+                page = broker.find("fixture", "", "", cursor, 20, _ACTOR)
+                if page["status"] == "ready":
+                    self.assertTrue(page["coverage_complete"], page["coverage"])
+                    self.assertEqual({row["source_id"] for row in page["coverage"]}, set(routes))
+                    expected = {tuple(item["vouchers"][0]) for row in page["threads"]
+                                for source in row["matched_sources"] for item in rows[source]
+                                if item["canonical"] == digest(row["title"])}
+                    self.assertEqual(attested, expected)
+                    delivered.extend(page["threads"])
+                    sizes.append(len(page["threads"]))
+                    if not page["has_more"]:
+                        break
+                cursor = page["next_cursor"]
+            else:
+                self.fail("Healthy sources should finish within the aggregate lifetime")
+        titles = [row["title"] for row in delivered]
+        self.assertEqual(len(titles), 19)
+        self.assertEqual(len(set(titles)), 19)
+        self.assertEqual(delivered, sorted(delivered, key=lambda row: (row["updated_at"],
+                                                                      row["stable_thread_id"]), reverse=True))
+        self.assertGreater(len(sizes), 1)
+        merged = next(row for row in delivered if row["title"] == "harness0")
+        self.assertEqual(merged["matched_sources"], ["codeg", "harness"])
 
     def test_cursor_cannot_cross_actor_or_binding_and_pages_are_revalidated(self):
         native = hit("native", "newest", "2026-10-12T00:00:00+00:00")

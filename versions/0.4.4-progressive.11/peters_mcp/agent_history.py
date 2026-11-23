@@ -645,7 +645,7 @@ class AgentHistoryCore:
                          "next_cursor": self._token(scope, "find", key=cache_id, offset=end, parameters=params) if more else None},
                         scope.key, ("find", project_id, tuple(voucher for _, vouchers, _, _ in page for voucher in vouchers)))
 
-    def _scan_agent_source(self, project_id, query, agent, source_id, cursor, actor, policy_actor):
+    def _scan_agent_source(self, project_id, query, agent, source_id, cursor, actor, policy_actor, search_key=""):
         if (cursor or not isinstance(query, str) or len(query) > 200
                 or (agent and not AGENT.fullmatch(agent)) or not SOURCE.fullmatch(source_id)):
             raise _error("Invalid source search parameters.", "invalid_arguments")
@@ -667,7 +667,7 @@ class AgentHistoryCore:
         return Prepared({"status": "ready", "rows": results, "coverage": report}, scope.key,
                         ("find", project_id, ()))
 
-    def _validate_agent_hits(self, project_id, source_id, vouchers, cursor, actor, policy_actor):
+    def _validate_agent_hits(self, project_id, source_id, vouchers, cursor, actor, policy_actor, search_key=""):
         if cursor or not SOURCE.fullmatch(source_id) or not isinstance(vouchers, str) or len(vouchers) > 48 * 1024:
             raise _error("Invalid source validation parameters.", "invalid_arguments")
         try:

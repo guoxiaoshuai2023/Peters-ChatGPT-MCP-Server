@@ -11,11 +11,17 @@ import time
 from .agent_history import ERROR_CODES, VERSION, _restart, coverage_status, unified
 from .agent_history_policy import AGENT, IDENTIFIER
 from .catalog import AccessError, integer
+from .history_process import bound_worker_replies
 from .project_guard import collect_page_aliases, retain_history_aliases
 
 _MAX_SEARCHES = 12
 _MAX_AGE = 300
 _MAX_ATTEMPTS = 6
+_ADMISSION_SECONDS = 25
+_PAGE_SECONDS = 12
+_MAX_SINGLE_ROW_SECONDS = 40
+# A 40 s indivisible row can span ten ordinary 4 s worker demands.
+_MAX_SINGLE_ROW_POLLS = 12
 _MAX_SOURCE_ROWS = 64
 _CONTINUATION = frozenset({"processing", "busy", "waiting_source_stable"})
 _RESTART = frozenset({"unauthorized", "agent_policy_invalid", "private_protection_unavailable"})
@@ -33,7 +39,7 @@ class _Task:
     vouchers: str = ""
     cursor: str = ""
     attempts: int = 0
-    validated: bool = False
+    busy_since: float | None = None
 
 
 @dataclass(frozen=True)
@@ -57,6 +63,7 @@ class _Search:
     ordered: list | None = None
     offset: int = 0
     validation: tuple | None = None
+    page_limit: int | None = None
 
 
 def _malformed():
@@ -167,12 +174,20 @@ class AggregateFind:
         token = self._core._resume(cursor, "aggregate", scope, params) if cursor else None
         with self._lock:
             now = time.monotonic()
-            for key, state in tuple(self._searches.items()):
-                if now - state.started > _MAX_AGE and not state.lock.locked():
-                    del self._searches[key]
+            retired = [self._searches.pop(key) for key, state in tuple(self._searches.items())
+                       if now - state.started > _MAX_AGE and not state.lock.locked()]
+            if token is None and len(self._searches) == _MAX_SEARCHES:
+                evict = next((item for item in self._searches.values() if not item.lock.locked()), None)
+                if evict is not None:
+                    retired.append(self._searches.pop(evict.key))
+        # Only this search can own its keyed worker requests. Retire children
+        # outside the broker lock so unrelated callers can continue.
+        for state in retired:
+            self._release_pending(state)
+        with self._lock:
             if token is not None:
                 state = self._searches.get(token["key"])
-                if state is None or now - state.started > _MAX_AGE:
+                if state is None or time.monotonic() - state.started > _MAX_AGE:
                     raise _restart()
                 if not state.lock.acquire(blocking=False):
                     return None
@@ -181,10 +196,7 @@ class AggregateFind:
                     raise _restart()
                 return state
             if len(self._searches) == _MAX_SEARCHES:
-                evict = next((item for item in self._searches.values() if not item.lock.locked()), None)
-                if evict is None:
-                    return None
-                del self._searches[evict.key]
+                return None
             sources = tuple(self._core._sources(scope, "", params[2].casefold()))
             state = _Search(secrets.token_hex(16), sources, deque(_Task(source) for source in sources))
             state.lock.acquire()
@@ -194,6 +206,12 @@ class AggregateFind:
     def _discard(self, state):
         with self._lock:
             self._searches.pop(state.key, None)
+        self._release_pending(state)
+
+    def _release_pending(self, state):
+        for task in (*state.scans, *(state.validation or ())):
+            if task.cursor:
+                self._release(task, {})
 
     def _cursor(self, state, scope, params):
         state.sequence += 1
@@ -220,27 +238,53 @@ class AggregateFind:
         return value
 
     @staticmethod
-    def _retry(task, response):
-        if response["status"] not in _CONTINUATION or task.attempts >= _MAX_ATTEMPTS:
+    def _retry(task, response, *, max_processing_polls=_MAX_ATTEMPTS):
+        status = response["status"]
+        if status not in _CONTINUATION:
             return False
         cursor = response.get("next_cursor")
-        if isinstance(cursor, str) and 0 < len(cursor) <= 4096:
+        has_cursor = isinstance(cursor, str) and 0 < len(cursor) <= 4096
+        if has_cursor:
             task.cursor = cursor
-            return True
-        return response["status"] == "busy"
+        if status == "busy":
+            # No source work was admitted. Fast polls must not eat the budget
+            # of a healthy queued source while other routes own the workers.
+            now = time.monotonic()
+            if task.busy_since is None:
+                task.busy_since = now
+            if now - task.busy_since >= _ADMISSION_SECONDS:
+                return False
+        else:
+            task.busy_since = None
+            task.attempts += 1
+            if task.attempts >= (max_processing_polls if status == "processing" else _MAX_ATTEMPTS):
+                return False
+        return has_cursor or status == "busy"
 
     def _release(self, task, response):
         cursor = response.get("next_cursor") or task.cursor
+        task.cursor = ""
         if self._abandon is not None and isinstance(cursor, str) and cursor:
             self._abandon(task.source, cursor)
 
     def _scan(self, state, project_id, query, agent, caller):
-        task = state.scans.popleft()
-        task.attempts += 1
+        task = state.scans[0]
+        # The opaque search key keeps worker de-duplication and cancellation
+        # private to this search, even for two otherwise identical queries.
         arguments = {"project_id": project_id, "query": query, "agent": agent,
-                     "source_id": task.source, **caller}
+                     "source_id": task.source, "search_key": state.key, **caller}
         response = self._response(task, "scan_agent_source", arguments)
+        state.scans.popleft()
         status = response["status"]
+        admitted = next((other for other in state.scans if other.cursor), None)
+        if status == "busy" and not task.cursor and admitted is not None:
+            # The wait is caused by this very search. Drive its admitted work
+            # before starting the clock for external service contention.
+            task.busy_since = None
+            state.scans.remove(admitted)
+            state.scans.appendleft(admitted)
+            state.scans.append(task)
+            return
         if status == "ready":
             try:
                 rows = response.get("rows")
@@ -258,26 +302,55 @@ class AggregateFind:
             code = "processing_timeout" if status == "processing" else status
             state.coverage[task.source] = _failure(task.source, code)
 
-    def _validate(self, state, project_id, caller):
-        # Every displayed source must attest within the call that returns the
-        # page. A previous success may have gone stale while another source
-        # was processing, so the task is retained and run again on each call.
-        for task in state.validation:
+    def _page_budget(self, state, page):
+        self._release_pending(state)
+        if len(page) == 1:
+            # One deduplicated row is indivisible. If it cannot fit even its
+            # larger bounded call, omit the whole row and report that limit.
+            for task in state.validation:
+                report = state.coverage[task.source]
+                report["coverage_complete"] = False
+                report["warnings"] = sorted(set(report["warnings"]) | {"resource_exhausted"})
+            return None
+        # Keep the full ordered set and its untouched offset. The next call
+        # validates only this prefix, with a fresh collection of alias proofs.
+        state.page_limit = (len(page) + 1) // 2
+        state.validation = None
+        return False
+
+    def _validate(self, state, page, project_id, caller, deadline):
+        # Service held demands first. A healthy worker may finish a validation
+        # after its 4 s delivery window; leaving it idle while redoing earlier
+        # sources forces that whole validation to start again on the next poll.
+        tasks = sorted(state.validation, key=lambda task: not bool(task.cursor))
+        drain = len(page) == 1 or any(task.cursor for task in tasks)
+        polls = _MAX_SINGLE_ROW_POLLS if len(page) == 1 else _MAX_ATTEMPTS
+        for task in tasks:
+            if time.monotonic() >= deadline:
+                return self._page_budget(state, page)
             arguments = {"project_id": project_id, "source_id": task.source,
-                         "vouchers": task.vouchers, **caller}
+                         "vouchers": task.vouchers, "search_key": state.key, **caller}
             response = self._response(task, "validate_agent_hits", arguments)
-            if (task.validated and task.cursor
-                    and response["status"] in {"restart_required", "snapshot_expired"}):
-                # A completed worker may be evicted to make space for another
-                # source. The same bound vouchers can be validated from scratch.
+            if task.cursor and response["status"] in {"restart_required", "snapshot_expired"}:
+                # A worker cursor expired. Its original immutable vouchers must
+                # still pass a fresh load; ownership changes raise _restart().
                 task.cursor = ""
+                if time.monotonic() >= deadline:
+                    return self._page_budget(state, page)
                 response = self._response(task, "validate_agent_hits", arguments)
+            pending = self._retry(task, response, max_processing_polls=polls)
+            while drain and pending and response["status"] == "processing":
+                if time.monotonic() >= deadline:
+                    return self._page_budget(state, page)
+                response = self._response(task, "validate_agent_hits", arguments)
+                pending = self._retry(task, response, max_processing_polls=polls)
             status = response["status"]
+            if time.monotonic() >= deadline or (len(page) == 1 and status == "processing" and not pending):
+                return self._page_budget(state, page)
             if status == "ready":
-                task.validated = True
+                task.cursor, task.attempts, task.busy_since = "", 0, None
                 continue
-            task.attempts += 1
-            if self._retry(task, response):
+            if pending:
                 return False
             self._release(task, response)
             if state.offset:
@@ -286,6 +359,7 @@ class AggregateFind:
             state.coverage[task.source] = _failure(task.source, code)
             state.hits.pop(task.source, None)
             state.ordered = None
+            self._release_pending(state)
             state.validation = None
             return False
         return True
@@ -309,15 +383,25 @@ class AggregateFind:
                     return self._continuation(state, scope, params)
             if state.ordered is None:
                 state.ordered = _merge(state.hits)
-            end = state.offset + limit
+            end = min(len(state.ordered), state.offset + (state.page_limit or limit))
             page = state.ordered[state.offset:end]
             if state.validation is None:
                 state.validation = _validation_tasks(page)
-            with collect_page_aliases(self._core.policy) as aliases:
-                if not self._validate(state, project_id, caller):
+            seconds = _PAGE_SECONDS
+            if len(page) == 1:
+                seconds = min(_MAX_SINGLE_ROW_SECONDS, _PAGE_SECONDS * max(2, len(state.validation)))
+            deadline = time.monotonic() + seconds
+            with collect_page_aliases(self._core.policy) as aliases, bound_worker_replies(deadline):
+                verified = self._validate(state, page, project_id, caller, deadline)
+                if verified is not False and self._configuration(project_id, caller).key != scope.key:
+                    raise _restart()
+                if verified is True and page and time.monotonic() >= deadline:
+                    verified = self._page_budget(state, page)
+                if verified is False:
                     return self._continuation(state, scope, params)
-            if self._configuration(project_id, caller).key != scope.key:
-                raise _restart()
+                if verified is None:
+                    page = ()
+                    aliases.clear()
             coverage = [state.coverage[source] for source in state.sources]
             if unified(self._core.policy):
                 coverage = [{**item, "state": coverage_status(item["warnings"])} for item in coverage]

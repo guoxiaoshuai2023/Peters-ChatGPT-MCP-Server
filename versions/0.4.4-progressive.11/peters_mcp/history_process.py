@@ -6,7 +6,8 @@ inside the child for each live delivery request, including delayed polling.
 
 import base64
 from collections import deque
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
+from contextvars import ContextVar
 from dataclasses import asdict
 import hashlib
 import hmac
@@ -33,6 +34,16 @@ STAGES = frozenset(("_configuration", "_metadata", "_derive", "_snapshot"))
 PHASES = frozenset(("new", "operation", "validation", "scanning", "finalizing", "authorization_check", "candidate_scan", "delivery", "done", "unknown"))
 CURSOR_TTL = 1800
 PREFIX = "hp1."
+_reply_deadline = ContextVar("history_worker_reply_deadline", default=None)
+
+
+@contextmanager
+def bound_worker_replies(deadline):
+    token = _reply_deadline.set(deadline)
+    try:
+        yield
+    finally:
+        _reply_deadline.reset(token)
 
 
 def _json(value):
@@ -568,6 +579,10 @@ class IsolatedHistory:
         if len(encoded) > REQUEST_BYTES - 1024:
             raise AccessError("History arguments exceed the request limit.", code="resource_exhausted")
         started = time.monotonic()
+        expires = started + self._wait_seconds
+        deadline = _reply_deadline.get()
+        if deadline is not None:
+            expires = min(expires, deadline)
         with self._lock:
             if self._closed:
                 raise AccessError("History worker is closed.", code="restart_required")
@@ -632,9 +647,9 @@ class IsolatedHistory:
             waiter = {"id": task["id"], "attempt": task["attempt"],
                       "event": threading.Event(), "reply": None}
             self._queue({"type": "demand", "id": task["id"], "nonce": nonce,
-                         "revision": task["revision"], "until": started + self._wait_seconds})
+                         "revision": task["revision"], "until": expires})
             self._waiters[nonce] = waiter
-        waiter["event"].wait(max(0, self._wait_seconds - (time.monotonic() - started)))
+        waiter["event"].wait(max(0, expires - time.monotonic()))
         with self._lock:
             self._waiters.pop(nonce, None)
             reply = waiter["reply"]
@@ -676,9 +691,13 @@ class IsolatedHistory:
     def _verify_delivery_topology(self, digest, project_id):
         from .project_guard import project_token, require_request_epoch
         from .workspaces import discovery_deadline
-        with discovery_deadline(time.monotonic() + self._step_seconds):
+        bound = time.monotonic() + self._step_seconds
+        deadline = _reply_deadline.get()
+        with discovery_deadline(min(bound, deadline) if deadline is not None else bound):
             self._catalog.refresh()
             observed = self._catalog.repositories.discover_all().topology
+            if deadline is not None and time.monotonic() >= deadline:
+                raise TimeoutError()
             if not observed.complete or observed.digest_for(project_id) != digest:
                 raise AccessError("Project topology changed after history validation.", code="restart_required")
         if project_id is None:

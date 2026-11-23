@@ -10,7 +10,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from peters_mcp.catalog import AccessError
-from peters_mcp.history_process import IsolatedHistory, REQUEST_BYTES, RESPONSE_BYTES, _frame
+from peters_mcp.history_process import IsolatedHistory, REQUEST_BYTES, RESPONSE_BYTES, _frame, bound_worker_replies
 
 
 class SyntheticEngine:
@@ -132,6 +132,16 @@ class HistoryProcessTests(unittest.TestCase):
         result = self.finish(facade, args, initial)
         self.assertEqual(result["original_cursor"], "original-third-page")
         self.assertEqual(result["calls"], 1)
+
+    def test_reply_deadline_caps_only_the_current_demand(self):
+        facade = self.facade(wait_seconds=2)
+        self.finish(facade, {"thread_id": "normal"})
+        arguments = {"thread_id": "slow"}
+        with bound_worker_replies(time.monotonic() + 0.02):
+            pending = facade.read_codex_thread(**arguments)
+        self.assertEqual(pending["status"], "processing")
+        ready = self.finish(facade, arguments, pending)
+        self.assertEqual(ready["calls"], 2)
 
     def test_continuation_rejects_forgery_method_or_parameters(self):
         facade = self.facade(wait_seconds=0.05)

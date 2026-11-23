@@ -22,6 +22,10 @@ metadata. A newly registered repository in an existing working directory
 can expose verified sessions begun under that repository. Background
 observations rotate through bounded sets of registered worktrees.
 
+Cross-source searches resume active source checks before starting another
+worker. Larger pages can return a shorter sorted prefix with a continuation.
+Each merged result retains its matched sources and their verification.
+
 Background saves, candidate creation, history workers and streamed exports
 carry evidence of the verified Git worktrees through to their commit or
 delivery boundary. This candidate remains in isolated verification.

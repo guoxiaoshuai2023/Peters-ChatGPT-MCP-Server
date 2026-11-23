@@ -41,6 +41,13 @@ repository or directory proof. The result coverage entries distinguish complete 
 unverified attribution, source availability, unsupported formats and work
 limits. A verified conversation can still expose `missing_steps` in its read.
 
+For a search across sources, continue with the same arguments and the returned
+cursor until `has_more` is false. The page size is an upper bound. A large
+page can be shortened so that each displayed result and all its matched
+sources are rechecked before delivery. A single merged row that exceeds the
+bounded verification window contributes `resource_exhausted` to its sources'
+coverage. Other verified rows remain available through pagination.
+
 Automatic history inheritance also verifies when the physical project occupied
 the recorded path. The first grant can include existing sessions when every
 directory component has evidence covering the native creation and final

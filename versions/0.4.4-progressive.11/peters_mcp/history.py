@@ -654,6 +654,19 @@ class HistoryAccess:
         cached['created'] = time.monotonic()
         return cached['projection'],cached['snapshot'],current['decoded_bytes']>cached['snapshot']['bytes']
 
+    def transient_projection_iter(self, config, row):
+        """Verify one native projection for a consumer that owns its own cursor."""
+        reader = HistoryAccess(self.config_path, self.project_ids, self.catalog, unified_policy=self.unified_policy)
+        try:
+            yield from reader._ensure_iter(config, row, projection=True)
+            projected, snapshot, _ = reader._snapshot(config, row)
+            yield from reader._revalidate_iter(config, {row['id']: row}, {row['id']: snapshot})
+            return projected, snapshot
+        finally:
+            # No legacy page or tool reference escapes this operation. Its
+            # private storage cannot evict or pin another caller's snapshots.
+            reader.close()
+
     def _revalidate_iter(self, config, rows, snapshots=None):
         options = ({"caller": config["caller"], "project_id": config["project_id"]} if config.get("unified") else {})
         fresh = self._configuration(**options)

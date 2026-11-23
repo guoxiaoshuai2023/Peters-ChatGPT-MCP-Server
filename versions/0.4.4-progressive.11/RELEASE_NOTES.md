@@ -25,6 +25,9 @@ observations rotate through bounded sets of registered worktrees.
 Cross-source searches resume active source checks before starting another
 worker. Larger pages can return a shorter sorted prefix with a continuation.
 Each merged result retains its matched sources and their verification.
+Codex projection and linked Codeg records use an operation-local native
+snapshot. Successive project queries keep the existing legacy snapshot
+capacity available for its public page and tool cursors.
 
 Background saves, candidate creation, history workers and streamed exports
 carry evidence of the verified Git worktrees through to their commit or

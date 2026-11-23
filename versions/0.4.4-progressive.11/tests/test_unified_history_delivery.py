@@ -157,6 +157,45 @@ class UnifiedDeliveryTests(unittest.TestCase):
                 self.assertEqual(response.status_code, 401)
                 self.assertEqual(response.json(), {'error': 'Cloudflare Access authentication required.'})
 
+    def test_agent_search_can_page_past_eight_codex_projections_with_a_live_legacy_cursor(self):
+        home = Path(self.document['sources']['codex']['root'])
+        project = self.document['projects'][0]['root']
+        titles = set()
+        with sqlite3.connect(home / 'state_5.sqlite') as db:
+            for number in range(10):
+                native_id = f'bb123456-1234-4234-8234-{number:012x}'
+                title = f'Projection witness {number}'
+                titles.add(title)
+                stamp = datetime.now(timezone.utc).isoformat()
+                path = home / 'sessions' / f'rollout-witness-{native_id}.jsonl'
+                path.write_bytes(encode([{**row, 'timestamp': stamp} for row in (
+                    record('session_meta', {'id': native_id, 'cwd': project, 'timestamp': stamp}),
+                    message(title), message('Answer ' + title, 'assistant', 'final', native_id='answer'))]))
+                db.execute('INSERT INTO threads VALUES (?,?,?,?,?,?)',
+                           (native_id, str(path), project, title, int(time.time()), 0))
+        legacy = {'thread_id': THREAD, 'limit': 1}
+        error, first = self.complete('read_codex_thread', legacy)
+        self.assertFalse(error, first)
+        self.assertTrue(first['has_more'])
+        arguments = {'source_id': 'codex', 'project_id': 'synthetic', 'query': 'Projection witness', 'limit': 4}
+        rows = []
+        while True:
+            error, page = self.complete('find_agent_threads', arguments)
+            self.assertFalse(error, page)
+            self.assertNotIn('resource_exhausted', page['coverage'][0]['warnings'])
+            rows.extend(page['threads'])
+            if not page['has_more']:
+                break
+            arguments['cursor'] = page['next_cursor']
+        self.assertEqual(len(rows), 10)
+        self.assertEqual({row['title'] for row in rows}, titles)
+        error, read = self.complete('read_agent_thread', {'thread_ref': rows[-1]['thread_ref']})
+        self.assertFalse(error, read)
+        self.assertEqual([item['text'] for item in read['entries']], [rows[-1]['title'], 'Answer ' + rows[-1]['title']])
+        error, second = self.complete('read_codex_thread', {**legacy, 'cursor': first['next_cursor']})
+        self.assertFalse(error, second)
+        self.assertEqual(second['entries'][0]['text'], SECOND_TEXT)
+
     def test_only_returned_migrated_native_hits_require_the_former_root_at_http_delivery(self):
         policy, old = migrated_desktop(self, Path(self.tmp) / 'migration', self.document)
         previous = self.client.app.verifier

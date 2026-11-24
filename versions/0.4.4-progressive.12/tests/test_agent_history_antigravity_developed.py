@@ -48,7 +48,8 @@ class DevelopedDesktopTests(unittest.TestCase):
         self.assertIsNone(native._tool(*tool(path=str(root/'plan.md'), extra=((6, 1),)), artifact_roots=(root,)))
         self.assertIsNone(native._tool(*tool(path=str(received_by/'nested'/'plan.md'), extra=((6, 1),)),
                                        artifact_roots=(root,received_by)))
-        for path in (root, root/'..'/'other', root.parent/'other'/'plan.md', root/'.system_generated'/'log'):
+        for path in (root, root/'..'/'other', root.parent/'other'/'plan.md', root/'.system_generated'/'log',
+                     root/'.SYSTEM_GENERATED'/'log', received_by/'.SyStEm_GeNeRaTeD'/'log'):
             with self.subTest(path=path), self.assertRaises(native.EvidenceIssue):
                 native._tool(*tool(path=str(path), extra=((6, 1),)), artifact_roots=(root,received_by))
 

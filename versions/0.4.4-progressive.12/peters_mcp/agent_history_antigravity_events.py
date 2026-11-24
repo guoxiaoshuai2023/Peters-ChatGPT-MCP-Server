@@ -3,6 +3,7 @@
 from hashlib import sha256
 import json
 from pathlib import PurePosixPath
+import unicodedata
 
 from .agent_history_antigravity_native import Fields, _epoch, _uuid, require
 
@@ -84,8 +85,10 @@ def builtin(name, call_raw, raw, status, events, index, *, artifact_roots=()):
             path = PurePosixPath(args['Path'].decode('utf-8'))
             # The action may target this conversation or its verified direct
             # parent. This check authenticates the event and never opens a file.
+            private = any(unicodedata.normalize('NFC', part).casefold() == '.system_generated'
+                          for part in path.parts)
             require(edit.one(6, 0) == 1 and name == b'write_file' and '..' not in path.parts
-                    and '.system_generated' not in path.parts and any(
+                    and not private and any(
                         root in path.parents for root in artifact_roots), TOOL_REASON)
     elif descriptor == b'SearchWeb':
         query = Fields(payload, {1, 2}, allowed={1, 2, 3, 4, 5})

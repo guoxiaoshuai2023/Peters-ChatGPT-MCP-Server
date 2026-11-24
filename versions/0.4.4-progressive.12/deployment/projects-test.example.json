@@ -1,0 +1,9 @@
+{
+  "projects": [
+    {
+      "id": "connection-test",
+      "name": "MCP connection test",
+      "root": "/absolute/path/to/Peters-ChatGPT-MCP-Server/deployment/test-project"
+    }
+  ]
+}

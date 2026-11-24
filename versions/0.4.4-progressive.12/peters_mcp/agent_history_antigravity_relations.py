@@ -108,7 +108,7 @@ def _incoming(raw, parent, relation, created):
             and sha256(source.one(3, default=b'')).hexdigest() == relation[4], RELATION)
 
 
-def _operation(meta, payload, status, parent, receipt, completion, artifact_root):
+def _operation(meta, payload, status, parent, receipt, completion, artifact_roots):
     call = meta.one(4)
     header = Fields(call, {2, 9})
     name = header.one(2)
@@ -132,10 +132,10 @@ def _operation(meta, payload, status, parent, receipt, completion, artifact_root
                 Fields(result, set(), allowed={1, 3, 7})
             require(payload.one(31) is not None, RELATION)
         else:
-            _tool(meta, raw, status=status, artifact_root=artifact_root)
+            _tool(meta, raw, status=status, artifact_roots=artifact_roots)
 
 
-def _run(db, sender, parent, receipts, trajectory, count, child_birth, parent_end, artifact_root, digest):
+def _run(db, sender, parent, receipts, trajectory, count, child_birth, parent_end, artifact_roots, digest):
     # The observed delivery profile has one uninterrupted, locally spawned run.
     # No user continuations, cascaded senders, active tasks, or workspace changes.
     rows = db.execute('SELECT idx,step_type,status,has_subtrajectory,substr(metadata,1,?),'
@@ -170,7 +170,7 @@ def _run(db, sender, parent, receipts, trajectory, count, child_birth, parent_en
         if kind == 101:
             _incoming(payload.one(slot), parent, spawn, created)
         if kind == 132:
-            _operation(meta, payload, status, parent, receipts.get(idx), completion, artifact_root)
+            _operation(meta, payload, status, parent, receipts.get(idx), completion, artifact_roots)
         else:
             require(idx not in receipts, RELATION)
         if kind in (15, 132):
@@ -220,7 +220,7 @@ def verify_senders(root, thread, contexts, relations, birth, last):
                 trajectory, child_birth = _header(db, sender, thread, contexts, digest)
                 require(birth <= child_birth and all(child_birth <= r[5] <= last for r in receipts.values()), RELATION)
                 _run(db, sender, thread.native_id, receipts, trajectory, count, child_birth, last,
-                     root.path / 'brain' / sender, digest)
+                     (root.path / 'brain' / sender, root.path / 'brain' / thread.native_id), digest)
             require(_database_stamps(root, native) == stamps, 'native_capture_changed')
             _digest(digest, repr(stamps).encode())
     return digest.digest()

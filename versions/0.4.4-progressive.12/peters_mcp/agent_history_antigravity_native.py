@@ -315,7 +315,7 @@ def _user_body(raw, text):
     return True, public, spec
 
 
-def _tool(meta, raw, *, status=3, events=None, index=None, artifact_root=None):
+def _tool(meta, raw, *, status=3, events=None, index=None, artifact_roots=()):
     from .agent_history_antigravity_events import BUILTINS, builtin
     call = Fields(meta.one(4), {2, 9})
     name = call.one(2)
@@ -325,7 +325,7 @@ def _tool(meta, raw, *, status=3, events=None, index=None, artifact_root=None):
     if source == 1 and name in (b'read_file', b'run_command'):
         return None
     if source == 1 and bytes(name) in BUILTINS:
-        builtin(bytes(name), meta.one(4), raw, status, events, index, artifact_root=artifact_root)
+        builtin(bytes(name), meta.one(4), raw, status, events, index, artifact_roots=artifact_roots)
         return None
     require(source == 3 and bytes(name).startswith(b'mcp_') and MCP_NAME.fullmatch(name),
             'native_tool_lifecycle_unverified')
@@ -430,7 +430,7 @@ def _steps(db, trajectory, native_id, manifest, messages, digest, birth, *, even
             require(message is None, 'native_visible_message_mismatch')
             if kind == 132:
                 name = _tool(meta, payload.one(slot), status=status, events=events, index=idx,
-                             artifact_root=events.artifact_root)
+                             artifact_roots=events.artifact_roots)
                 if name is not None:
                     tools.setdefault(execution, set()).add(name)
                 if status == 6:
@@ -585,7 +585,7 @@ def capture(adapter, thread, *, excluded_related=()):
     with root.sqlite(INDEX) as db:
         claim = _index_claim(db, thread)
     workspaces, count, busy = claim
-    events = NativeEvents(thread.native_id, artifact_root=root.path / 'brain' / thread.native_id)
+    events = NativeEvents(thread.native_id, artifact_roots=(root.path / 'brain' / thread.native_id,))
     with root.sqlite(native) as db:
         trajectory, contexts, birth = _trajectory(db, thread, workspaces, digest)
         aligned, discarded = align_manifest(db, manifest, count, busy, paired)

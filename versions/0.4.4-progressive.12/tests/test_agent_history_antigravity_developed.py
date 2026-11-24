@@ -42,12 +42,15 @@ class DevelopedDesktopTests(unittest.TestCase):
         self.assertIsNone(native._tool(*tool()))
         self.assertIsNone(native._tool(*tool(default=True)))
 
-    def test_artifact_marker_is_limited_to_the_same_native_session(self):
+    def test_artifact_marker_is_limited_to_the_verified_native_participants(self):
         root = PurePosixPath('/synthetic/brain') / SESSION
-        self.assertIsNone(native._tool(*tool(path=str(root/'plan.md'), extra=((6, 1),)), artifact_root=root))
-        for path in (root, root/'..'/'other', root.parent/'other'/'plan.md'):
+        received_by = root.parent / FIRST
+        self.assertIsNone(native._tool(*tool(path=str(root/'plan.md'), extra=((6, 1),)), artifact_roots=(root,)))
+        self.assertIsNone(native._tool(*tool(path=str(received_by/'nested'/'plan.md'), extra=((6, 1),)),
+                                       artifact_roots=(root,received_by)))
+        for path in (root, root/'..'/'other', root.parent/'other'/'plan.md', root/'.system_generated'/'log'):
             with self.subTest(path=path), self.assertRaises(native.EvidenceIssue):
-                native._tool(*tool(path=str(path), extra=((6, 1),)), artifact_root=root)
+                native._tool(*tool(path=str(path), extra=((6, 1),)), artifact_roots=(root,received_by))
 
     def test_wrong_provider_name_original_payload_and_args_never_vouch_for_a_write(self):
         for options in ({'component': 3}, {'name': b'unknown_tool'}, {'original': b'edit_file'},

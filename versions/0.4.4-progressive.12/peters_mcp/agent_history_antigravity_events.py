@@ -63,7 +63,7 @@ def verified_arguments(name, call_raw, generic_raw, required, optional=(), *, bo
     return args, generic.one(2)
 
 
-def builtin(name, call_raw, raw, status, events, index, *, artifact_root=None):
+def builtin(name, call_raw, raw, status, events, index, *, artifact_roots=()):
     descriptor, required, optional = BUILTINS[name]
     args, result_raw = verified_arguments(name, call_raw, raw, required, optional, bool_keys=('Overwrite',))
     if status == 1:
@@ -82,9 +82,11 @@ def builtin(name, call_raw, raw, status, events, index, *, artifact_root=None):
                 and edit.one(2) == args['Path'], TOOL_REASON)
         if edit.one(6, 0) is not None:
             path = PurePosixPath(args['Path'].decode('utf-8'))
-            require(edit.one(6, 0) == 1 and name == b'write_file' and artifact_root is not None
-                    and path != artifact_root and path.is_relative_to(artifact_root)
-                    and '..' not in path.parts, TOOL_REASON)
+            # The action may target this conversation or its verified direct
+            # parent. This check authenticates the event and never opens a file.
+            require(edit.one(6, 0) == 1 and name == b'write_file' and '..' not in path.parts
+                    and '.system_generated' not in path.parts and any(
+                        root in path.parents for root in artifact_roots), TOOL_REASON)
     elif descriptor == b'SearchWeb':
         query = Fields(payload, {1, 2}, allowed={1, 2, 3, 4, 5})
         require(query.one(1) == args['query'] and query.one(2) == args.get('domain'), TOOL_REASON)
@@ -111,9 +113,9 @@ def builtin(name, call_raw, raw, status, events, index, *, artifact_root=None):
 
 
 class NativeEvents:
-    def __init__(self, cascade, *, artifact_root=None):
+    def __init__(self, cascade, *, artifact_roots=()):
         self.cascade = cascade
-        self.artifact_root = artifact_root
+        self.artifact_roots = artifact_roots
         self.tasks = {}
         self.closed_tasks = set()
         self.spawns = {}

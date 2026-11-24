@@ -4,12 +4,15 @@ import json
 from pathlib import Path
 import sqlite3
 import tempfile
+from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 import uuid
 
 from peters_mcp.agent_history_antigravity_native import EvidenceIssue
-from peters_mcp.agent_history_source import SourceRoot, Thread
+from peters_mcp.agent_history import AgentHistoryCore
+from peters_mcp.agent_history_source import Projection, SourceRoot, Thread
+from peters_mcp.catalog import AccessError
 from test_agent_history_antigravity_native import message, varint, SECONDS
 
 PARENT, CHILD, PROJECT, TRAJECTORY, EXECUTION, INIT, MSG = (str(uuid.UUID(int=i)) for i in range(101, 108))
@@ -147,6 +150,16 @@ class SenderReceiptTests(unittest.TestCase):
             return native_sqlite(name)
         with patch.object(self.root,'sqlite',side_effect=only_index), self.assertRaises(EvidenceIssue):
             self.verify()
+
+    def test_core_rechecks_the_policy_for_each_contributing_sender(self):
+        projection = Projection((), 'revision', 'identity', related_threads=(CHILD,))
+        scope = SimpleNamespace(project='allowed')
+        core = AgentHistoryCore(None, None, None, b'')
+        for denied, pins in (({CHILD},{}), (set(),{CHILD:'different-project'})):
+            source = SimpleNamespace(denied=denied, threads=pins)
+            with self.subTest(denied=bool(denied)), self.assertRaises(AccessError) as failure:
+                core._binding(scope, source, self.thread, projection)
+            self.assertEqual(failure.exception.code, 'unauthorized')
 
     def test_fork_or_different_native_call_is_rejected(self):
         with self.assertRaises(EvidenceIssue):

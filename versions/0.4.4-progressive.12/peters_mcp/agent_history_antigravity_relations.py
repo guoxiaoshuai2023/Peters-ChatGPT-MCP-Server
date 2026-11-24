@@ -135,7 +135,7 @@ def _operation(meta, payload, status, parent, receipt, completion, artifact_root
             _tool(meta, raw, status=status, artifact_root=artifact_root)
 
 
-def _run(db, sender, parent, receipts, trajectory, count, child_birth, artifact_root, digest):
+def _run(db, sender, parent, receipts, trajectory, count, child_birth, parent_end, artifact_root, digest):
     # The observed delivery profile has one uninterrupted, locally spawned run.
     # No user continuations, cascaded senders, active tasks, or workspace changes.
     rows = db.execute('SELECT idx,step_type,status,has_subtrajectory,substr(metadata,1,?),'
@@ -143,7 +143,7 @@ def _run(db, sender, parent, receipts, trajectory, count, child_birth, artifact_
                       (MAX_BLOB + 1, MAX_BLOB + 1, count + 1))
     steps, generated, errors = [], {}, {}
     spawn = next(iter(receipts.values()))
-    previous = child_birth
+    previous = latest_completion = child_birth
     for i, (idx, kind, status, nested, metadata, raw, fmt) in enumerate(rows):
         require(i == idx < count and nested == fmt == 0 and kind in (15, 17, 101, 132)
                 and (status == 3 or (kind, status) == (132, 7)) and (kind == 101) == (i == 0), RELATION)
@@ -159,6 +159,9 @@ def _run(db, sender, parent, receipts, trajectory, count, child_birth, artifact_
         require(created >= previous, RELATION)
         previous = created
         completion = _step_completion(meta, kind, status, created)
+        if idx in receipts or idx == count - 1:
+            require(latest_completion <= completion <= parent_end, 'native_snapshot_not_committed')
+        latest_completion = max(latest_completion, completion)
         slot = STEP_SLOTS[kind]
         tags = {1, 4, 5, slot} | ({31} if status == 7 else set())
         payload = Fields(raw, tags, allowed=tags)
@@ -216,7 +219,7 @@ def verify_senders(root, thread, contexts, relations, birth, last):
             with root.sqlite(native) as db:
                 trajectory, child_birth = _header(db, sender, thread, contexts, digest)
                 require(birth <= child_birth and all(child_birth <= r[5] <= last for r in receipts.values()), RELATION)
-                _run(db, sender, thread.native_id, receipts, trajectory, count, child_birth,
+                _run(db, sender, thread.native_id, receipts, trajectory, count, child_birth, last,
                      root.path / 'brain' / sender, digest)
             require(_database_stamps(root, native) == stamps, 'native_capture_changed')
             _digest(digest, repr(stamps).encode())

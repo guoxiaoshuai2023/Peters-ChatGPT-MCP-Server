@@ -1,5 +1,4 @@
 """Regression checks for a native parent/child send receipt in one project."""
-from dataclasses import replace
 import hashlib
 import json
 from pathlib import Path
@@ -76,14 +75,14 @@ class SenderReceiptTests(unittest.TestCase):
         self.db.execute('INSERT INTO trajectory_metadata_blob VALUES(?,?)',('main',meta))
         self.db.commit()
 
-    def step(self, idx, kind, body, *, call=None, origin=CHILD):
+    def step(self, idx, kind, body, *, call=None, origin=CHILD, finished=TIME, invocation=None):
         source={101:5,15:2,132:2}[kind]
         fields={101:114,15:20,132:140}
         states={101:(3,),15:(8,3),132:(1,2,3)}[kind]
-        gen=1 if idx==3 else 0
-        timeline=message(*[(1,message((1,state),(2,TIME))) for state in states])
+        gen=(1 if idx==3 else 0) if invocation is None else invocation
+        timeline=message(*[(1,message((1,state),(2,finished if state == 3 else TIME))) for state in states])
         extra=[(4,call),(38,1)] if call else []
-        meta=message((1,TIME),(3,source),(8,TIME),(12,EXECUTION),
+        meta=message((1,TIME),(3,source),(8,finished),(12,EXECUTION),
                      (20,message((1,TRAJECTORY),(2,idx),(3,gen),(4,origin))), (26,timeline),*extra)
         self.db.execute('INSERT OR REPLACE INTO steps VALUES(?,?,3,0,?,?,0)',
                         (idx,kind,meta,message((1,kind),(4,3),(5,meta),(fields[kind],body))))
@@ -96,6 +95,48 @@ class SenderReceiptTests(unittest.TestCase):
 
     def test_two_native_ends_agree(self):
         self.assertEqual(32,len(self.verify()))
+
+    def test_two_separate_sends_from_same_inherited_run(self):
+        from peters_mcp.agent_history_antigravity_relations import verify_senders
+        args = {'Recipient': PARENT, 'Message': 'Second synthetic receipt'}
+        call = message((1, 'send-4'), (2, 'send_message'), (3, json.dumps(args)), (9, 'send_message'))
+        result = message((1, PARENT), (2, 'fixture'), (3, args['Message']))
+        typed = message((1, 'type.googleapis.com/exa.cortex.core.tools.SendMessage'), (2, result))
+        generic = message(*[(1, message((1, key), (2, val))) for key, val in args.items()],
+                          (2, message((6, typed))))
+        self.step(3, 15, message((7, call)), invocation=1)
+        self.step(4, 132, generic, call=call, invocation=1)
+        self.step(5, 15, message((8, 'done'), (12, 2)), invocation=2)
+        self.index.execute('UPDATE conversation_summaries SET step_count=6')
+        self.index.commit()
+        self.db.execute('UPDATE executor_metadata SET data=? WHERE idx=0',
+                        (message((1, 4), (2, 3), (3, 5), (9, EXECUTION)),))
+        for idx, positions in ((1, (3,4)), (2, (5,))):
+            self.db.execute('INSERT OR REPLACE INTO gen_metadata VALUES(?,?)',
+                            (idx, message((2, bytes(positions)), (4, EXECUTION))))
+        self.db.commit()
+        second = (CHILD, 4, hashlib.sha256(call).hexdigest(), *self.relation[3:])
+        evidence = verify_senders(self.root, self.thread, self.thread.contexts, [self.relation, second],
+                                  (SECONDS,0), (SECONDS,1))
+        self.assertEqual(32, len(evidence))
+
+    def test_preceding_work_cannot_finish_after_its_send(self):
+        self.step(1,15,message((7,SEND)),finished=message((1,SECONDS+20)))
+        with self.assertRaises(EvidenceIssue):
+            self.verify()
+
+    def test_sender_final_cannot_extend_past_the_parents_committed_range(self):
+        self.step(3, 15, message((1, 'done'), (8, 'done'), (12, 2)), finished=message((1, SECONDS+1)))
+        with self.assertRaises(EvidenceIssue):
+            self.verify()
+
+    def test_duplicate_receipt_and_source_replacement_are_rejected(self):
+        from peters_mcp.agent_history_antigravity_relations import verify_senders
+        with self.assertRaises(EvidenceIssue):
+            verify_senders(self.root,self.thread,self.thread.contexts,[self.relation]*2,(SECONDS,0),(SECONDS,1))
+        self.step(1,15,message((7,SEND)),origin=PARENT)
+        with self.assertRaises(EvidenceIssue):
+            self.verify()
 
     def test_sender_in_other_project_is_rejected_before_trajectory_open(self):
         self.index.execute('UPDATE conversation_summaries SET project_id=?',(str(uuid.UUID(int=909)),))

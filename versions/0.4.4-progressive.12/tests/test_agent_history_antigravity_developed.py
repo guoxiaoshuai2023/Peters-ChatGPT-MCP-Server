@@ -4,6 +4,7 @@ import json
 import sqlite3
 import unittest
 from hashlib import sha256
+from pathlib import PurePosixPath
 
 from peters_mcp import agent_history_antigravity_native as native
 from peters_mcp.agent_history_antigravity_events import NativeEvents, verified_arguments
@@ -11,8 +12,9 @@ import test_agent_history_antigravity_native as sample
 from test_agent_history_antigravity_native import FIRST, SECOND, SESSION, SECONDS, TRAJECTORY, message
 
 
-def tool(name=b'write_file', component=1, original=None, declared=b'FileEdit', changed_args=False, default=False):
-    args = {'Path': '/synthetic/note', 'Content': 'private fixture', 'Overwrite': False}
+def tool(name=b'write_file', component=1, original=None, declared=b'FileEdit', changed_args=False, default=False,
+         path='/synthetic/note', extra=()):
+    args = {'Path': path, 'Content': 'private fixture', 'Overwrite': False}
     if default:
         del args['Overwrite']
     entries = [(1, message((1, k), (2, v if isinstance(v, str) else json.dumps(v))))
@@ -23,7 +25,7 @@ def tool(name=b'write_file', component=1, original=None, declared=b'FileEdit', c
     if original is not None:
         call.append((9, original))
     metadata = native.Fields(message((4, message(*call)), (38, component)), {4, 38})
-    typed = message((1, 2), (2, '/synthetic/note'), (3, 'opaque'), (4, 'opaque'))
+    typed = message((1, 2), (2, path), (3, 'opaque'), (4, 'opaque'), *extra)
     envelope = message((1, b'type.googleapis.com/exa.cortex.core.tools.' + declared), (2, typed))
     result = message((1, 'private synthetic result'), (3, b''), (6, envelope), (7, 'file:///private/reference'))
     return metadata, message(*entries, (2, result))
@@ -39,6 +41,13 @@ class DevelopedDesktopTests(unittest.TestCase):
     def test_committed_native_write_is_recognized(self):
         self.assertIsNone(native._tool(*tool()))
         self.assertIsNone(native._tool(*tool(default=True)))
+
+    def test_artifact_marker_is_limited_to_the_same_native_session(self):
+        root = PurePosixPath('/synthetic/brain') / SESSION
+        self.assertIsNone(native._tool(*tool(path=str(root/'plan.md'), extra=((6, 1),)), artifact_root=root))
+        for path in (root, root/'..'/'other', root.parent/'other'/'plan.md'):
+            with self.subTest(path=path), self.assertRaises(native.EvidenceIssue):
+                native._tool(*tool(path=str(path), extra=((6, 1),)), artifact_root=root)
 
     def test_wrong_provider_name_original_payload_and_args_never_vouch_for_a_write(self):
         for options in ({'component': 3}, {'name': b'unknown_tool'}, {'original': b'edit_file'},

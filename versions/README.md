@@ -1,5 +1,18 @@
 # 独立发布源码快照
 
+[`0.5.4`](0.5.4/AGENT_HISTORY.md) 从冻结的 `0.4.4-progressive.12` 派生，面向产品化修复四来源（Codex、Antigravity Desktop 2.32.1 / 2.33+、Codeg、DeepSeek Harness）的历史发现、归属核验、完整性恢复、官方公开视图对齐与双向搜索归属：
+
+- **项目物理身份、墓碑与 Codex 分叉/附属/子 Agent 精确归属**：废除 macOS APFS 父目录 `st_ctime_ns` 误拒机制（仅当 `st_ctime_ns > st_mtime_ns` 视为路径拓扑变更），新增独立持久化路径墓碑 `.path-tombstones.json`（`0600`，`active.json` 保持与 `.12` 回滚兼容）。普通稀疏 `paginated` 分叉按原生 `history_base` 重建截断点前的已授权同项目父前文（排除分叉后父追加，缺截断证据显式报 `inherited_prefix_unverified`）；附属会话（`attached_thread=true` 或 `attached_thread_parent_id`）与原生派生子 Agent 会话（`source` 声明 `subagent`）继续强制完整父血缘授权、同项目隔离与翻页中途撤权校验（`parent_context_inlined=false`），默认全文与检索仅交付该子会话自身的已核验公开消息；无条件过滤 `auto-compact-*` 内部压缩桥接记录与非 `"user"` 来源（`provenance.type != "user"` 或 `multi_agent.*` `content_item_kinds`，如 `wait_agent` 工具产生的多 Agent 完成通知）注入块以消除父子会话双向误命中，同时不在四来源公共 `sanitize()` 中按纯文本标签剥离 `<subagent_notification>`，原样保留用户或助手在公开会话中输入的字面 `<subagent_notification>` 文本、标题与后续段落；剥离图文附件外层合成 `<image ...>...</image>` 包装以对齐官方镜像去重，同时保留真实连续重复发送与字面 `<image>` 文本；统一与兼容入口 `view="latest_turn"` 对齐可靠 `latest_turn_id`。
+- **Antigravity 双轨验证、提交边界保护与全依赖物理戳缓存**：支持 Checkpoint 压缩步骤双轨恢复（`compacted_steps_from_transcript`）、子 Agent 同源隔离校验、活跃进行中线程（`thread_in_progress`）、稳定 `turn_id` 及通用内建工具提交边界保护；`_CAPTURE_CACHE` 端到端绑定 `INDEX`（+WAL/SHM）、主轨迹 DB（+WAL/SHM）、两份 transcript 及全部关联子 Agent DB（+WAL/SHM）四组物理戳，闭合验证后入缓存前的并发窗口。
+- **四来源诚实覆盖、并发性能与损坏清单标准回滚**：Codeg 诚实报告 `unsupported_agent_types`，统一输出零泄露 `unverified_project_candidates` 计数并提供 `agent_history_admin lint` / `preview-coverage`；工作进程池调整为 4 槽，配合纯物理戳绑定、无授权态的 Codex 证明/投影/前缀缓存及批处理范围复核满足温态查询延迟目标；`tools/release_cutover.py` 对载荷与最终 `manifest.json` 采用同目录临时文件 + `fsync` + `os.replace` 原子提交，支持从 0 字节、半截截断、非法 UTF-8 或缺清单现场执行标准 `rollback --confirm-rollback` 恢复 `.12` 并保持已撤权状态生效，重启探针严格要求存活 PID 与认证门 HTTP `401`。
+- 本快照在 macOS arm64 / Python 3.12.14 上完成完整单元与安全回归套件全部通过（含分片导出到期测试对并发文件描述符整数复用的原快照 inode 关闭校验，以及四来源字面 `<subagent_notification>` 公开正文保留回归），两次独立干净 `git archive` 重建逐字节一致；实际主机私有验收证据保留在操作者本机隔离目录，未收入公开仓库历史。当前仍处于隔离冻结状态，待独立技术复验及真实外部连接验收后决定生产切换。[候选构建清单](0.5.4/BUILD_SPEC.json)
+
+| `0.5.4` 固定包 | SHA-256 |
+| --- | --- |
+| source content | `c07578965eab82bd5ff69ca34e33a246c6bb2cab9f58f39dd0c4e28e9d59cbc0` |
+| candidate | `71cdd6e3cd14630f20ab5a8bcb044f9e82c276153945bcbe9fb8e240f86e9b83` |
+| generated inspection rollback | `4561333f752627a61447e8a67971580e622773d816039afb6d7936f4b3340054` |
+
 [`0.4.4-progressive.11`](0.4.4-progressive.11/AGENT_HISTORY.md) 从冻结的 .9 派生。同一 ChatGPT 连接使用一份项目白名单获得已启用的文件能力和经核实的多来源会话。隔离源站已读回六个项目中四种真实来源的会话，包括 Antigravity Desktop 2.33.0 自动归属的记录。正式启用仍需通过真实 ChatGPT 连接的查读与原生文件交付验收。[候选构建清单](0.4.4-progressive.11/BUILD_SPEC.json)
 
 统一项目白名单的隔离候选为 [`0.4.4-progressive.9`](0.4.4-progressive.9/AGENT_HISTORY.md)。它预览迁移，统一各已启用来源的项目授权，并将旧 Codex 工具纳入同一授权检查。Antigravity 自动归属仍待验收。构建清单和固定包指纹见 [BUILD_SPEC](0.4.4-progressive.9/BUILD_SPEC.json)。

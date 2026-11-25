@@ -1,0 +1,38 @@
+{
+  "version": 1,
+  "sources": {
+    "codeg": {
+      "adapter": "codeg",
+      "root": "/absolute/source/codeg",
+      "format": "0.45.0",
+      "enabled": false,
+      "inherit_projects": false,
+      "actors": {},
+      "threads": {},
+      "denied_threads": [],
+      "links": {
+        "codex": "codex",
+        "deepseek_harness": "deepseek"
+      }
+    },
+    "deepseek": {
+      "adapter": "deepseek_harness",
+      "root": "/absolute/source/dsh/sessions",
+      "format": "0.2.2-rc.3",
+      "enabled": false,
+      "inherit_projects": false,
+      "actors": {},
+      "threads": {},
+      "denied_threads": []
+    },
+    "antigravity": {
+      "adapter": "antigravity",
+      "root": "/absolute/source/antigravity",
+      "enabled": false,
+      "inherit_projects": false,
+      "actors": {},
+      "threads": {},
+      "denied_threads": []
+    }
+  }
+}

@@ -1,5 +1,17 @@
 # 独立发布源码快照
 
+[`0.5.5`](0.5.5/AGENT_HISTORY.md) 从已发布的 [`0.5.4`](0.5.4/AGENT_HISTORY.md) 派生，定向闭合 macOS `ProcessType=Background`（`taskpolicy -b`）后台调度下大型 Antigravity Desktop 轨迹冷启动步骤超时，以及统一 `v2` 工作进程超时状态报告与撤权保护：
+
+- **Antigravity 协作式有界步骤让出（后台 QoS 冷启动稳定收敛）**：将 `Adapter._snapshot`、`_recover`、`capture`、`_steps`、`_generations`、关联子 Agent `verify_senders` 与公开消息脱敏 `_record` 拆分为协作式生成器让出点（`capture_iter`、`snapshot_iter`、`snapshot_for_inheritance_iter`、`_record_iter`），完整保留全部 TOCTOU 复采样、SQLite WAL/SHM 一致性校验与 `_CAPTURE_CACHE` 四组物理戳绑定；在正式后台 QoS 下冷启动查找、等待续页、全量分页读取与 `view="latest_turn"` 均在单步监管预算内稳定完成。
+- **统一 `v2` 工作进程超时诚实报告与撤权即时阻断**：在 `IsolatedHistory._call` 中区分无数据控制应答（`control_only`：`processing_timeout`、`resource_exhausted`、`restart_required`、`snapshot_expired`），真实步骤超时如实返回结构化 `processing_timeout` / `restart_required`（聚合检索仅将该来源标记为 `warnings=["processing_timeout"]` 并正常返回健康来源命中），不再误报物理拓扑校验异常；同时在入口与控制应答路径复核实时 `v2` 项目、来源及 `denied_threads` 权限，读取途中或超时后撤权立即停止交付。
+- 本快照在 macOS arm64 / Python 3.12.14 上完成受改动影响的定向单元与安全回归套件全部通过，两次独立干净 `git archive` 重建逐字节一致；实际主机后台 QoS 验收证据保留在操作者本机隔离目录，未收入公开仓库历史。[候选构建清单](0.5.5/BUILD_SPEC.json)
+
+| `0.5.5` 固定包 | SHA-256 |
+| --- | --- |
+| source content | `4e3c3373183594de9599035c128198a96d6899b252bef060f9d534e1b39e56c3` |
+| candidate | `66d641052da882a1aa96f4b4dcbf476322336298416e0cbbd0cfc35d60f9ca9b` |
+| generated inspection rollback | `b20c3b5ff288d795f042a3ccab02839afe89a3182386ceefec0a25f56b17e739` |
+
 [`0.5.4`](0.5.4/AGENT_HISTORY.md) 从冻结的 `0.4.4-progressive.12` 派生，面向产品化修复四来源（Codex、Antigravity Desktop 2.32.1 / 2.33+、Codeg、DeepSeek Harness）的历史发现、归属核验、完整性恢复、官方公开视图对齐与双向搜索归属：
 
 - **项目物理身份、墓碑与 Codex 分叉/附属/子 Agent 精确归属**：废除 macOS APFS 父目录 `st_ctime_ns` 误拒机制（仅当 `st_ctime_ns > st_mtime_ns` 视为路径拓扑变更），新增独立持久化路径墓碑 `.path-tombstones.json`（`0600`，`active.json` 保持与 `.12` 回滚兼容）。普通稀疏 `paginated` 分叉按原生 `history_base` 重建截断点前的已授权同项目父前文（排除分叉后父追加，缺截断证据显式报 `inherited_prefix_unverified`）；附属会话（`attached_thread=true` 或 `attached_thread_parent_id`）与原生派生子 Agent 会话（`source` 声明 `subagent`）继续强制完整父血缘授权、同项目隔离与翻页中途撤权校验（`parent_context_inlined=false`），默认全文与检索仅交付该子会话自身的已核验公开消息；无条件过滤 `auto-compact-*` 内部压缩桥接记录与非 `"user"` 来源（`provenance.type != "user"` 或 `multi_agent.*` `content_item_kinds`，如 `wait_agent` 工具产生的多 Agent 完成通知）注入块以消除父子会话双向误命中，同时不在四来源公共 `sanitize()` 中按纯文本标签剥离 `<subagent_notification>`，原样保留用户或助手在公开会话中输入的字面 `<subagent_notification>` 文本、标题与后续段落；剥离图文附件外层合成 `<image ...>...</image>` 包装以对齐官方镜像去重，同时保留真实连续重复发送与字面 `<image>` 文本；统一与兼容入口 `view="latest_turn"` 对齐可靠 `latest_turn_id`。

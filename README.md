@@ -1,22 +1,25 @@
 # Peters ChatGPT MCP Server
 
-[MIT License](LICENSE)
+[MIT License](LICENSE) · **当前正式稳定维护基线：[`v0.5.5`](versions/0.5.5/AGENT_HISTORY.md)**（正式 Tag `v0.5.5`，冻结提交 `b20a5891e3b5047cd6fc261f28223004de84fee0`） · [长期维护与开发入口](MAINTAINING.md) · [发布索引](versions/README.md)
 
-**Antigravity 版本兼容修复：[`0.4.4-progressive.8`](versions/0.4.4-progressive.8/AGENT_HISTORY.md)**。配置 Antigravity 会话读取时可以省略应用版本号。读取器继续校验本地索引、日志结构和逐线程授权。发布包指纹见[发布索引](versions/README.md)。
+> **正式生产与维护基线说明**
+> - 本仓库唯一正式稳定发布与后续维护入口为 **[`versions/0.5.5/`](versions/0.5.5/)**（`BUILD_SPEC.json` 候选指纹 `66d641052da882a1aa96f4b4dcbf476322336298416e0cbbd0cfc35d60f9ca9b`，检查用回滚指纹 `b20c3b5ff288d795f042a3ccab02839afe89a3182386ceefec0a25f56b17e739`）。
+> - `v0.5.5` 在 macOS arm64 / Python 3.12.14 上已完成独立技术复验、受控生产上线及真实 ChatGPT 外部端验收，支持统一 `v2` 项目白名单、Git worktree 自动发现、候选 Markdown 交付，以及 Codex、Antigravity Desktop（2.32.1 / 2.33+，含 macOS `ProcessType=Background` 后台冷启长轨迹）、Codeg 0.45.0 与 DeepSeek Harness 四来源只读会话核验与分页读取。
+> - **根目录 `peters_mcp/`（标记为 `0.6.0`）为早期独立实验开发线，已停止向生产推进，请勿用于生产部署或作为新功能基线**；所有后续维护与修复请按 [MAINTAINING.md](MAINTAINING.md) 从 `versions/0.5.5/` 派生。
 
-**项目会话继承修复：[`0.4.4-progressive.4`](versions/0.4.4-progressive.4/README.md)**。启用项目继承后，已授权目录及仓库的现有和新建 Codex 线程自动获得公开文字读取权限；无需逐线程登记。另修复压缩历史、含大型附件的记录校验和公开消息兼容。版本、构建指纹、测试及各机器部署状态见[发布索引](versions/README.md)。部署这次修复请使用该快照及其 `BUILD_SPEC.json`；根目录 `0.6.0` 是独立开发线，旧快照保持冻结，不以根目录开发功能替换生产运行包。
+---
 
-基线 [`0.4.4-progressive.3`](versions/README.md) 修复分片父任务在 macOS 睡眠后的到期计时，完成 70 项定向检查、100 MB 认证 SDK 演练及 8 KiB 原生收件验收。本次 `.4` 沿用其文件／导出实现；这些历史结果不替代新包或另一台机器的实际运行验收。
+### 历史基线摘要（供追溯）
 
-既有 100 MB **原生大件**验收来自 `.2` 的 ChatGPT Web / GPT-5.6 Sol / Chat / High 环境，本轮没有重跑该长流程；新 `.3` 的 100 MB SDK 演练沿用额外 RSS **256 MiB** 目标。当前生产容量配置保持 100 MB，默认模板/SDK 参数仍为 30 MB/128 MiB，旧单次出口仍为 12,659,780 字节。结果仅覆盖相应已验环境和样本。快照与根目录其他开发功能隔离，clone 不继承机器配置、运行状态或原生验收资格；私有资料、配置及验收原件不随仓库分发。
+- [`0.4.4-progressive.8`](versions/0.4.4-progressive.8/AGENT_HISTORY.md)：Antigravity 版本兼容修复。
+- [`0.4.4-progressive.4`](versions/0.4.4-progressive.4/README.md)：项目级 Codex 会话继承与 `.jsonl.zst` 压缩历史支持。
+- [`0.4.4-progressive.2` / `.3`](versions/README.md)：可选原生原件导出（12.66 MB 单次与 `raw-parts-v1` 30 MB / 100 MB 分片）及休眠到期修复；默认模板保持关闭，按主机显式配置启用。
 
-让 ChatGPT 或其他 MCP 客户端按需查阅你指定的本地项目文档和代码，减少反复上传文件的工作。服务运行在存放资料的电脑上；你用配置文件决定开放哪些项目，一套服务可以连接多个 repo，不需要给每个业务 repo 单独开发 MCP。
+让 ChatGPT 或其他 MCP 客户端按需查阅你指定的本地项目文档、代码与授权 Agent 历史会话，减少反复上传文件的工作。服务运行在存放资料的电脑上；你用私有配置文件决定开放哪些项目与能力，一套服务可以连接多个目录或仓库，不需要给每个业务仓库单独开发 MCP。
 
-**clone 只得到程序、测试和配置模板，不会继承任何人的项目目录、仓库身份、Codex 会话授权或云端连接。** 首次使用必须在自己的机器上配置。当前版本：`0.6.0`。
+**clone 只得到程序、测试和配置模板，不会继承任何人的项目目录、仓库身份、会话授权或云端连接。** 首次使用必须在自己的机器上按 [`versions/0.5.5/README.md`](versions/0.5.5/README.md) 与 [`versions/0.5.5/AGENT_HISTORY.md`](versions/0.5.5/AGENT_HISTORY.md) 完成私有配置。
 
-0.6.0 改造[历史读取](CODEX_HISTORY.md)：逐块处理原始日志，在可终止的隔离子进程中保留有上限的内存快照，支持续处理及最近／指定轮次读取。移除了整份原日志 64 MiB 的入口限制，仍保留公开文字和计算资源边界；不新增持久历史索引或准备写工具，也不改变授权范围。
-
-0.5.0 引入的[原文件包交付](PACKAGE_DELIVERY.md)仍默认关闭：它需要额外配置写入目标与文件来源，不会自动扩展既有权限；旧的 48 KiB 候选 Markdown 接口保持原语义。代码版本不代表运行中的服务已经更新；历史改造的合成数据网页验收已完成，真实资料在正式入口的验收与生产切换仍需单独完成，不应在切换时顺带启用文件包功能。
+> 以下章节为根目录旧 `0.6.0` 实验线文档原文保留；正式部署、测试与升级请直接前往 [`versions/0.5.5/`](versions/0.5.5/) 与 [MAINTAINING.md](MAINTAINING.md)。
 
 ## 它能做什么
 

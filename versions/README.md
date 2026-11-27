@@ -4,15 +4,15 @@
 
 **最新修复候选：[`0.5.6`](0.5.6/AGENT_HISTORY.md)**（从冻结的 `0.5.5` 派生，尚待独立 L4 复验及生产主机现场验证，未替代当前正式基线 `v0.5.5`）：
 
-- **Antigravity 非公开旧步骤逐字节原样重放去重**：当 Antigravity 在后续日志行中逐字节原样重写先前已提交的非公开状态记录（如 `GENERIC` / `RUNNING`）时，`_Transcript.__iter__` 通过该非公开步骤的精确原始行 SHA-256 摘要识别并跳过重复行，使已授权会话不再在 `find_agent_threads` 标题搜索中因 `unsupported_format` 消失；同时不推进 `prior_index`，完整保留真实向前跳号 `missing_steps`、`unfinished_messages_omitted`、全文件原始字节 `revision` 指纹、单文件追加 `prefix` 校验与 `MAX_RECORDS` 资源上限。任何同编号但状态/内容/来源/时间戳/字节编码不同的修改、任何公开角色（`USER_INPUT`/`USER_EXPLICIT`、`PLANNER_RESPONSE`/`MODEL`）或未知来源重放、以及首次出现即落入旧编号范围的记录，均保持 fail-closed 拒读（`unsupported_format`）。
-- **双日志重放一致性交叉核验**：当精简日志发生非公开原样重放且存在伴生 `transcript_full.jsonl` 时，`_snapshot_iter` 强制走双日志配对 `_recover_iter`，要求两份日志在各自内部均为逐字节原样重放且在相同行位记录相同的 `[line_index, step_index, type, source, status, created_at]` 摘要（允许非公开记录正文在精简/完整日志间存在压缩差异）；任一方缺失重放、行位错位或内容冲突均 fail-closed（`v1` 报 `unsupported_format`，`v2` 报 `association_unverified`）。
+- **Antigravity 非公开旧步骤逐字节原样重放去重**：当 Antigravity 在后续日志行中逐字节原样重写先前已提交且**来源可识别**的非公开状态记录（`USER_INPUT`/`PLANNER_RESPONSE` 仅限 `SYSTEM`/`SYSTEM_SDK`/`USER_IMPLICIT`，其余非公开类型仅限 `MODEL`/`SYSTEM`/`SYSTEM_SDK`/`USER_IMPLICIT`）时，`_Transcript.__iter__` 通过该步骤的精确原始行 SHA-256 摘要识别并跳过重复行，使已授权会话不再在 `find_agent_threads` 标题搜索中因 `unsupported_format` 消失；同时不推进 `prior_index`，完整保留真实向前跳号 `missing_steps`、`unfinished_messages_omitted`、全文件原始字节 `revision` 指纹、单文件追加 `prefix` 校验与 `MAX_RECORDS` 资源上限。任何同编号但状态/内容/来源/时间戳/字节编码不同的修改、任何公开角色（`USER_INPUT`/`USER_EXPLICIT`、`PLANNER_RESPONSE`/`MODEL`）或未知来源重放、以及首次出现即落入旧编号范围的记录，均保持 fail-closed 拒读（`unsupported_format`）。
+- **双日志重放双向对称交叉核验**：只要伴生 `transcript_full.jsonl` 存在，`_snapshot_iter` 即对精简日志与完整日志执行双向对称重放核验（`_recover_iter`），要求两份日志各自内部逐字节原样重放且在完全相同行位记录一致的 `[line_index, step_index, type, source, status, created_at]` 摘要（允许非公开记录正文在精简/完整日志间存在压缩差异）；任一侧缺失重放（无论精简日志是否截断）、行位错位、或双日志重放场景下任一侧存在未提交残缺尾行均 fail-closed（`v1` 报 `unsupported_format`，`v2` 报 `association_unverified`），无伴生日志的单文件追加语义保持不变。
 - **当前验收状态**：已完成合成单元测试、安全边界测试、`v1`/`v2` MCP 标题搜索与 `next_cursor` 分页读取回归及双次独立复构校验；候选包暂不放行生产，待独立 L4 复验与现场复查完成后另行评审。[候选构建清单](0.5.6/BUILD_SPEC.json)
 
 | `0.5.6` 候选固定包 | SHA-256 |
 | --- | --- |
-| source content | `5dd5fcba038f78335edd18fae2fae74b027a8a32ff2aba7afaf717665dbb510b` |
-| candidate（待 L4 复验） | `2fcc7d7f7fc7a480128e7e0d9ad79e8b2d6d2673c1faf3a0ef4b55ac80cb8bcd` |
-| generated inspection rollback | `9ec49442e3991c807c27623daa73e70b4e2b898b50e70c5763c4f30b2d45222a` |
+| source content | `7c9467cc3eee85c4810628e7f5f72fc9691e3ddb48cd42ebe928db73bc5b94ec` |
+| candidate（待 L4 复验） | `a3964fc12b0df9285c535eaaa215aa2fb92b9afa6967e8770acc00d6dfceac94` |
+| generated inspection rollback | `6dfcdeb077139176b288fada7498d351e15dd155c971268c19f487d8d2b07a4a` |
 
 [`0.5.5`](0.5.5/AGENT_HISTORY.md) 从 [`0.5.4`](0.5.4/AGENT_HISTORY.md) 派生，定向闭合 macOS `ProcessType=Background`（`taskpolicy -b`）后台调度下大型 Antigravity Desktop 轨迹冷启动步骤超时，以及统一 `v2` 工作进程超时状态报告与撤权保护：
 

@@ -27,13 +27,15 @@ Key behavioral guarantees in `0.5.6`:
   `view=turn`), with cooperative `scanning`/`finalizing` checkpoints keeping
   cold multi-thousand-step captures within per-step supervisor budgets under
   macOS `ProcessType=Background` (`taskpolicy -b`). When Antigravity rewrites a
-  previously committed non-public record byte-for-byte verbatim at a later line,
+  previously committed recognized non-public record (`MODEL`/`SYSTEM`/`SYSTEM_SDK`/`USER_IMPLICIT`,
+  never public roles or unknown sources) byte-for-byte verbatim at a later line,
   the reader deduplicates it without masking genuine forward `missing_steps`,
   `unfinished_messages_omitted`, raw byte `revision` fingerprints, single-file
-  `prefix` append proofs, or `MAX_RECORDS` limits, and corroborates matching
+  `prefix` append proofs, or `MAX_RECORDS` limits, and corroborates symmetric
   replay positions/metadata whenever `transcript_full.jsonl` is present. Any
-  mutated replay, public-message replay, unseen older `step_index`, or two-log
-  replay mismatch fails closed.
+  mutated replay, public-message or unknown-source replay, unseen older
+  `step_index`, one-sided replay in either log, or incomplete tail on either
+  side of a paired replay fails closed.
 - **Honest coverage, truthful timeouts, and fail-closed revocations**: Coverage
   entries report exact states, project-scoped `unverified_project_candidates`
   counts, and Codeg `unsupported_agent_types` without revealing foreign or

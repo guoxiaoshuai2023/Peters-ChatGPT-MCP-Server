@@ -7,25 +7,30 @@ integrity checks across both `v1` and `v2` paths:
 
 - **Verbatim non-public step replay deduplication (`agent_history_antigravity.py`)**:
   `_Transcript.__iter__` records exact raw-line SHA-256 digests only for
-  non-public records (excluding `VISIBLE_ROLES`, `source="USER_EXPLICIT"`, and
-  unrecognized `USER_INPUT`/`PLANNER_RESPONSE` provenance). When an already-seen
-  non-public `step_index <= prior_index` reappears with an exact byte-for-byte
-  identical line, the duplicate line is skipped without aborting thread parsing
-  or altering `prior_index`, preserving genuine forward `missing_steps`,
+  recognized non-public internal/status records (`source in {"SYSTEM",
+  "SYSTEM_SDK", "USER_IMPLICIT"}` for `USER_INPUT`/`PLANNER_RESPONSE`, and
+  `source in {"MODEL", "SYSTEM", "SYSTEM_SDK", "USER_IMPLICIT"}` for other
+  non-public record types; all `VISIBLE_ROLES`, `USER_EXPLICIT`, and unknown
+  sources are never eligible). When an already-seen eligible non-public
+  `step_index <= prior_index` reappears with an exact byte-for-byte identical
+  line, the duplicate line is skipped without aborting thread parsing or
+  altering `prior_index`, preserving genuine forward `missing_steps`,
   `unfinished_messages_omitted`, raw byte `revision` fingerprints, single-file
   append-only `prefix` checks, and `MAX_RECORDS` / byte budgets. Any mutated
   field (`status`, `content`, `source`, `type`, `created_at`, extra keys, or
-  non-identical byte encoding), any replayed public/unrecognized-provenance
-  step, or any unseen older `step_index` continues to fail closed with
-  `unsupported_format`.
-- **Two-log replay corroboration across `v1` and `v2`**: When a transcript
-  contains a verbatim non-public replay and `transcript_full.jsonl` exists,
-  `_snapshot_iter` pairs both logs via `_recover_iter` and requires identical
-  replay counts and position/metadata digests (`[line_index, step_index, type,
-  source, status, created_at]`) across both files while allowing non-public
-  content compaction differences between `compact` and `full`. Missing,
-  shifted, or conflicting replay evidence between the two logs fails closed
-  (`unsupported_format` in `v1`; `association_unverified` in `v2`).
+  non-identical byte encoding), any replayed public or unknown-source step, or
+  any unseen older `step_index` fails closed with `unsupported_format`.
+- **Symmetric two-log replay corroboration across `v1` and `v2`**: Whenever
+  `transcript_full.jsonl` exists alongside `transcript.jsonl`, `_snapshot_iter`
+  corroborates both logs via `_recover_iter` and requires identical replay
+  counts and position/metadata digests (`[line_index, step_index, type, source,
+  status, created_at]`) across both files (allowing non-public content
+  compaction differences between `compact` and `full`). One-sided replays in
+  either `compact` or `full` (whether `compact` is truncated or intact),
+  shifted replay positions, or incomplete trailing lines on either side of a
+  paired replay fail closed symmetrically (`unsupported_format` in `v1`;
+  `association_unverified` in `v2`), while single-file append semantics remain
+  intact when no companion exists.
 - **Verification status**: Synthetic unit, security boundary, `v1`/`v2` MCP
   title-search, paginated `next_cursor`, `latest_turn`, and revocation tests
   pass; candidate bundle remains unpromoted pending independent L4 acceptance

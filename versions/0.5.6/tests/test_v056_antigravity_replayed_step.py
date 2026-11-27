@@ -149,6 +149,8 @@ class AntigravityReplayedStepAdapterTests(unittest.TestCase):
         answer_running = synthetic.step(2, 'PLANNER_RESPONSE', 'MODEL', 'Halfway', status='RUNNING')
         explicit_unknown = synthetic.step(3, 'FUTURE_NON_PUBLIC', 'USER_EXPLICIT', 'Hidden')
         unknown_source = synthetic.step(4, 'USER_INPUT', 'UNKNOWN_PROVENANCE', 'Hidden')
+        generic_unknown_source = synthetic.step(4, 'GENERIC', 'SYNTHETIC_NEW_SOURCE', '', status='RUNNING')
+        user_model_source = synthetic.step(4, 'USER_INPUT', 'MODEL', 'Hidden')
         tail = synthetic.step(5, 'GENERIC', 'MODEL', '')
 
         cases = {
@@ -157,6 +159,8 @@ class AntigravityReplayedStepAdapterTests(unittest.TestCase):
             'public_assistant_running_replay': [question, answer_running, tail, answer_running],
             'user_explicit_unknown_type_replay': [question, explicit_unknown, tail, explicit_unknown],
             'unrecognized_source_replay': [question, unknown_source, tail, unknown_source],
+            'generic_unrecognized_source_replay': [question, generic_unknown_source, tail, generic_unknown_source],
+            'user_input_model_source_replay': [question, user_model_source, tail, user_model_source],
             'unseen_old_step_index': [
                 question,
                 synthetic.step(5, 'PLANNER_RESPONSE', 'MODEL', 'Answer'),
@@ -241,23 +245,42 @@ class AntigravityReplayedStepAdapterTests(unittest.TestCase):
                     self.reader.snapshot(self.thread)
                 self.assertEqual(caught.exception.code, 'unsupported_format')
 
-        # Trailing incomplete line in companion while compact has a replay must fail closed.
-        synthetic.write_steps(self.compact, compact_rows)
-        synthetic.write_steps(self.full, full_rows)
-        with self.full.open('ab') as stream:
-            stream.write(b'{"step_index":6')
-        with self.assertRaises(AccessError) as caught:
-            self.reader.snapshot(self.thread)
-        self.assertEqual(caught.exception.code, 'unsupported_format')
+        # Trailing incomplete line on EITHER side of a paired replay must fail closed symmetrically.
+        for incomplete_side in ('full', 'compact'):
+            with self.subTest(incomplete_side=incomplete_side):
+                synthetic.write_steps(self.compact, compact_rows)
+                synthetic.write_steps(self.full, full_rows)
+                target_log = self.full if incomplete_side == 'full' else self.compact
+                with target_log.open('ab') as stream:
+                    stream.write(b'{"step_index":6')
+                with self.assertRaises(AccessError) as caught:
+                    self.reader.snapshot(self.thread)
+                self.assertEqual(caught.exception.code, 'unsupported_format')
 
-        # Conversely, when compact is strictly ordered (no replay) and has truncated text,
-        # an unexpected replay only in full preserves existing v1 partial-coverage fallback.
-        synthetic.write_steps(self.compact, [question, compact_running, truncated, later])
-        synthetic.write_steps(self.full, [question, full_running, recovered_answer, full_running, later])
-        fallback = self.reader.snapshot(self.thread)
-        self.assertEqual([m.text for m in fallback.messages], ['Question', 'Follow up'])
-        self.assertEqual(fallback.warnings, ('missing_steps', 'truncated_content_omitted'))
-        self.assertIsNotNone(fallback.prefix)
+        # One-sided replay ONLY in transcript_full.jsonl must also fail closed in both
+        # truncated-compact and intact-compact cases (never fall back to partial or silent full coverage).
+        intact_answer = synthetic.step(2, 'PLANNER_RESPONSE', 'MODEL', 'Head中间Tail')
+        for name, compact_case in (
+            ('only_full_replay_truncated_compact', [question, compact_running, truncated, later]),
+            ('only_full_replay_intact_compact', [question, compact_running, intact_answer, later]),
+        ):
+            with self.subTest(one_sided=name):
+                synthetic.write_steps(self.compact, compact_case)
+                synthetic.write_steps(self.full, full_rows)
+                with self.assertRaises(AccessError) as caught:
+                    self.reader.snapshot(self.thread)
+                self.assertEqual(caught.exception.code, 'unsupported_format')
+
+        # Single-file transcript (no companion) with replay + incomplete tail still preserves
+        # single-file append semantics with incomplete_tail_omitted.
+        self.full.unlink()
+        synthetic.write_steps(self.compact, [question, compact_running, intact_answer, compact_running, later])
+        with self.compact.open('ab') as stream:
+            stream.write(b'{"step_index":6')
+        single_partial = self.reader.snapshot(self.thread)
+        self.assertEqual([m.text for m in single_partial.messages], ['Question', 'Head中间Tail', 'Follow up'])
+        self.assertEqual(single_partial.warnings, ('incomplete_tail_omitted', 'missing_steps'))
+        self.assertIsNotNone(single_partial.prefix)
 
     def test_raw_byte_fingerprint_single_file_prefix_and_record_budget_preserved(self):
         question = synthetic.step(0, 'USER_INPUT', 'USER_EXPLICIT', 'Question')
@@ -622,6 +645,61 @@ class AntigravityReplayedStepMCPV1Tests(unittest.TestCase):
         self.assertTrue(is_err, stale)
         self.assertIn('restart_required', stale)
 
+    def test_v1_http_rejects_one_sided_full_replay_compact_incomplete_tail_and_unknown_source(self):
+        q1 = synthetic.step(0, 'USER_INPUT', 'USER_EXPLICIT', 'First question')
+        run_known = synthetic.step(1, 'GENERIC', 'MODEL', 'compact-status', status='RUNNING')
+        run_known_full = synthetic.step(1, 'GENERIC', 'MODEL', 'full-status', status='RUNNING')
+        run_unknown = synthetic.step(1, 'GENERIC', 'SYNTHETIC_NEW_SOURCE', '', status='RUNNING')
+        a1_intact = synthetic.step(2, 'PLANNER_RESPONSE', 'MODEL', 'Head中间Tail')
+        a1_trunc = synthetic.step(
+            2, 'PLANNER_RESPONSE', 'MODEL', 'Head\n<truncated 6 bytes>\nTail',
+            truncated_fields=['content'],
+        )
+        q2 = synthetic.step(3, 'USER_INPUT', 'USER_EXPLICIT', 'Second question')
+
+        scenarios = (
+            (
+                'only_full_replay_intact_compact',
+                [q1, run_known, a1_intact, q2],
+                [q1, run_known_full, a1_intact, run_known_full, q2],
+                b'',
+            ),
+            (
+                'only_full_replay_truncated_compact',
+                [q1, run_known, a1_trunc, q2],
+                [q1, run_known_full, a1_intact, run_known_full, q2],
+                b'',
+            ),
+            (
+                'compact_unterminated_after_replay',
+                [q1, run_known, a1_intact, run_known, q2],
+                [q1, run_known_full, a1_intact, run_known_full, q2],
+                b'{"step_index":4',
+            ),
+            (
+                'unknown_provenance_non_message_repeat',
+                [q1, run_unknown, a1_intact, run_unknown, q2],
+                [q1, run_unknown, a1_intact, run_unknown, q2],
+                b'',
+            ),
+        )
+        for name, compact_rows, full_rows, compact_tail in scenarios:
+            with self.subTest(scenario=name):
+                synthetic.write_steps(self.target_compact, compact_rows)
+                if compact_tail:
+                    with self.target_compact.open('ab') as stream:
+                        stream.write(compact_tail)
+                synthetic.write_steps(self.target_full, full_rows)
+                is_err, found = self.complete('find_agent_threads', {
+                    'project_id': 'alpha-project',
+                    'source_id': SOURCE_V1,
+                    'query': TARGET_TITLE,
+                })
+                self.assertFalse(is_err, found)
+                self.assertEqual(found['threads'], [], found)
+                self.assertFalse(found['coverage_complete'], found)
+                self.assertIn('unsupported_format', found['coverage'][0]['warnings'], found)
+
 
 class AntigravityReplayedStepMCPV2Tests(unittest.TestCase):
     def setUp(self):
@@ -824,14 +902,30 @@ class AntigravityReplayedStepMCPV2Tests(unittest.TestCase):
             ],
         )
 
-        # 3. Companion disagreement (full drops replay) fails closed in v2 native inheritance.
+        # 3. Companion disagreement (full drops replay) and unknown-source replay fail closed in v2.
         self.full_path.write_bytes(_encode_rows(self.full_rows[:-1]))
         self.assertEqual(self.fixture.reader.inspect_native(self.fixture.thread).state, 'unverified')
         with self.assertRaises(AccessError) as caught:
             self.fixture.reader.snapshot_for_inheritance(self.fixture.thread)
         self.assertEqual(caught.exception.code, 'association_unverified')
 
+        unknown_compact = [
+            {**row, 'source': 'SYNTHETIC_NEW_SOURCE'} if row.get('step_index') == 2 else row
+            for row in self.compact_rows
+        ]
+        unknown_full = [
+            {**row, 'source': 'SYNTHETIC_NEW_SOURCE'} if row.get('step_index') == 2 else row
+            for row in self.full_rows
+        ]
+        self.compact_path.write_bytes(_encode_rows(unknown_compact))
+        self.full_path.write_bytes(_encode_rows(unknown_full))
+        self.assertEqual(self.fixture.reader.inspect_native(self.fixture.thread).state, 'unverified')
+        with self.assertRaises(AccessError) as caught:
+            self.fixture.reader.snapshot_for_inheritance(self.fixture.thread)
+        self.assertEqual(caught.exception.code, 'association_unverified')
+
         # Restore matching companion, then revoke via v2 denied_threads generation activation.
+        self.compact_path.write_bytes(_encode_rows(self.compact_rows))
         self.full_path.write_bytes(_encode_rows(self.full_rows))
         revoked_doc = json.loads(json.dumps(self.document))
         revoked_doc['sources'][SOURCE_V2]['denied_threads'] = [native.SESSION]

@@ -2,7 +2,7 @@
 
 [MIT License](LICENSE) · 开发候选 `0.5.6`
 
-v2 模式下，把 Repo 加入项目清单后，ChatGPT 即可通过同一认证入口使用服务已启用的项目能力，并在单次有界请求内稳定发现、核验并读取 Codex、Antigravity Desktop（2.32.1 / 2.33+）、Codeg 与 DeepSeek Harness 四来源中归属可核实的历史、新建与进行中会话。`0.5.6` 在冻结的 `0.5.5` 正式稳定基线上定向修复 Antigravity 日志逐字节原样重写既有非公开状态步骤导致整条已授权会话从搜索结果消失的问题（仅对逐字节相同的已出现非公开记录去重，在存在 `transcript_full.jsonl` 时强制双日志重放位置与元数据一致，任何内容/状态/来源/时间戳变化、公开消息重放、首次出现旧编号或双日志分歧均 fail-closed，同时保留真实 `missing_steps`、`unfinished_messages_omitted`、原始字节指纹、单文件追加前缀与记录上限），并完整继承 `0.5.5` 的全部已验收能力（APFS `st_ctime_ns > st_mtime_ns` 与 `.path-tombstones.json`、Antigravity 协作式有界步骤让出与后台 QoS 稳定收敛、统一 `v2` 超时控制应答诚实报告与撤权即时阻断、Codex 分叉/附属/子 Agent 精确归属与字面 `<subagent_notification>` 保留、Codeg/DeepSeek 诚实覆盖、四来源并发与损坏清单可恢复回滚）。默认启动模式仍为 v1；本目录源码快照尚待独立 L4 复验与现场验证，不代表已切换生产。[多 Agent 会话读取与配置](AGENT_HISTORY.md)
+v2 模式下，把 Repo 加入项目清单后，ChatGPT 即可通过同一认证入口使用服务已启用的项目能力，并在单次有界请求内稳定发现、核验并读取 Codex、Antigravity Desktop（2.32.1 / 2.33+）、Codeg 与 DeepSeek Harness 四来源中归属可核实的历史、新建与进行中会话。`0.5.6` 在冻结的 `0.5.5` 正式稳定基线上定向修复 Antigravity 日志逐字节原样重写既有非公开状态步骤导致整条已授权会话从搜索结果消失的问题（仅对来源可识别的非公开记录做逐字节原样重放去重，存在 `transcript_full.jsonl` 时强制双向对称核验重放位置与元数据，任何字段/编码变化、公开消息或未知来源重放、首次出现旧编号、单侧重放或双日志任一侧残缺均 fail-closed，同时保留真实 `missing_steps`、`unfinished_messages_omitted`、原始字节指纹、单文件追加前缀与记录上限），并完整继承 `0.5.5` 的全部已验收能力（APFS `st_ctime_ns > st_mtime_ns` 与 `.path-tombstones.json`、Antigravity 协作式有界步骤让出与后台 QoS 稳定收敛、统一 `v2` 超时控制应答诚实报告与撤权即时阻断、Codex 分叉/附属/子 Agent 精确归属与字面 `<subagent_notification>` 保留、Codeg/DeepSeek 诚实覆盖、四来源并发与损坏清单可恢复回滚）。默认启动模式仍为 v1；本目录源码快照尚待独立 L4 复验与现场验证，不代表已切换生产。[多 Agent 会话读取与配置](AGENT_HISTORY.md)
 
 让 ChatGPT 或其他 MCP 客户端按需查阅你指定的本地项目文档和代码，减少反复上传文件的工作。服务运行在存放资料的电脑上；你用配置文件决定开放哪些项目，一套服务可以连接多个 repo，不需要给每个业务 repo 单独开发 MCP。
 

@@ -46,6 +46,8 @@ MAX_RECORD_BYTES = 2 * 1024 * 1024
 MAX_RECORDS = 50000
 MAX_VISIBLE_CHARS = 16 * 1024 * 1024
 VISIBLE_ROLES = {('USER_INPUT', 'USER_EXPLICIT'): 'user', ('PLANNER_RESPONSE', 'MODEL'): 'assistant'}
+KNOWN_INTERNAL_SOURCES = frozenset({'SYSTEM', 'SYSTEM_SDK', 'USER_IMPLICIT'})
+KNOWN_NON_PUBLIC_SOURCES = KNOWN_INTERNAL_SOURCES | frozenset({'MODEL'})
 TRUNCATION_MARKER = re.compile(r'\n<truncated ([1-9][0-9]{0,8}) bytes>\n')
 PAIRABLE_CAPTURE_WARNINGS = frozenset({'missing_steps'})
 INDEX_ROWS = '''SELECT s.conversation_id, substr(s.title, 1, 501),
@@ -169,16 +171,18 @@ def _text(record):
     return content
 
 
+class _ReplayError(AccessError):
+    """Non-monotonic ordering or two-log replay disagreement (always fail-closed)."""
+
+    def __init__(self, message):
+        super().__init__(message, code='unsupported_format')
+
+
 def _is_replayable_non_public_step(kind, source):
-    """Only non-public internal/status records may be deduplicated on exact replay."""
-    if (kind, source) in VISIBLE_ROLES:
-        return False
-    if source == 'USER_EXPLICIT' or (
-        kind in ('USER_INPUT', 'PLANNER_RESPONSE')
-        and source not in ('SYSTEM', 'SYSTEM_SDK', 'USER_IMPLICIT')
-    ):
-        return False
-    return True
+    """Only recognized non-public internal/status records may be deduplicated on exact replay."""
+    if kind in ('USER_INPUT', 'PLANNER_RESPONSE'):
+        return source in KNOWN_INTERNAL_SOURCES
+    return source in KNOWN_NON_PUBLIC_SOURCES
 
 
 class _Transcript:
@@ -226,7 +230,7 @@ class _Transcript:
                         self.replayed_digest.update(marker)
                         self.replayed_count += 1
                         continue
-                raise _unsupported('Antigravity transcript steps are not strictly ordered.')
+                raise _ReplayError('Antigravity transcript steps are not strictly ordered.')
             if index != prior_index + 1:
                 self.warnings.add('missing_steps')
             prior_index = index
@@ -522,27 +526,44 @@ class Adapter:
         revision = compact.revision
         identity = compact.identity
         prefix = (relative, compact.committed, revision)
-        # Automatic attribution needs both logs for an omitted or still-open
-        # tool row, or whenever transcript_full.jsonl exists alongside transcript.jsonl.
-        # When a verbatim non-public step replay was skipped and a companion log exists,
-        # corroborate both logs so conflicting two-log replay evidence fails closed.
+        # Automatic attribution and two-log replay corroboration check companion
+        # transcript_full.jsonl whenever it exists alongside transcript.jsonl so
+        # one-sided replays and incomplete paired replay states fail closed symmetrically.
         companion = relative.removesuffix('transcript.jsonl') + 'transcript_full.jsonl'
         has_companion = False
-        if manifest is not None or compact.replayed_count > 0:
+        try:
+            with self.root.open(companion):
+                has_companion = True
+        except AccessError:
+            has_companion = False
+        if has_companion and not (compact.warnings <= PAIRABLE_CAPTURE_WARNINGS):
+            if compact.replayed_count > 0:
+                raise _ReplayError('Antigravity transcript cannot corroborate replay while incomplete.')
+            yield {'phase': 'scanning'}
             try:
-                with self.root.open(companion):
-                    has_companion = True
-            except AccessError:
-                has_companion = False
-        require_pair = (
+                with _transcript(self.root, companion) as full:
+                    if full.before.st_size > 0:
+                        for step_no, _ in enumerate(full):
+                            if step_no and step_no % 256 == 0:
+                                yield {'phase': 'scanning'}
+                    if full.replayed_count > 0:
+                        raise _ReplayError('Antigravity companion steps do not match the compact transcript.')
+            except _ReplayError:
+                raise
+            except AccessError as error:
+                if error.code not in {'source_unavailable', 'unsupported_format', 'resource_exhausted'}:
+                    raise
+        require_pair = has_companion or (
             manifest is not None and (
-                has_companion or 'missing_steps' in warnings or any(row[3] == 'RUNNING' for row in manifest)
+                'missing_steps' in warnings or any(row[3] == 'RUNNING' for row in manifest)
             )
-        ) or (compact.replayed_count > 0 and has_companion)
+        )
         if ('truncated_content_omitted' in warnings or require_pair) and compact.warnings <= PAIRABLE_CAPTURE_WARNINGS:
             yield {'phase': 'scanning'}
             try:
                 recovered = yield from self._recover_iter(relative, compact)
+            except _ReplayError:
+                raise
             except AccessError as error:
                 if has_companion and (manifest is not None or compact.replayed_count > 0) and error.code == 'unsupported_format':
                     raise
@@ -609,13 +630,31 @@ class Adapter:
                 raise AccessError('Antigravity transcript changed during capture.', code='waiting_source_stable')
             if full.before.st_size == 0:
                 raise _unsupported('Antigravity companion contains incomplete steps.')
-            messages, warnings = yield from _project_iter(_paired_steps(compact, full))
+            try:
+                messages, warnings = yield from _project_iter(_paired_steps(compact, full))
+            except _ReplayError:
+                raise
+            except AccessError as error:
+                if error.code == 'unsupported_format':
+                    if compact.replayed_count > 0 or full.replayed_count > 0:
+                        raise _ReplayError('Antigravity companion steps do not match the compact transcript.') from None
+                    try:
+                        for step_no, _ in enumerate(full):
+                            if step_no and step_no % 256 == 0:
+                                yield {'phase': 'scanning'}
+                    except _ReplayError:
+                        raise
+                    except AccessError:
+                        pass
+                    if full.replayed_count > 0:
+                        raise _ReplayError('Antigravity companion steps do not match the compact transcript.') from None
+                raise
             # Exact step-by-step pairing proves any numbering gaps and replayed
             # non-public records are shared at identical positions across both logs.
             # A partial record or any other capture issue still disqualifies recovery.
             if (compact.replayed_count != full.replayed_count
                     or compact.replayed_digest.digest() != full.replayed_digest.digest()):
-                raise _unsupported('Antigravity companion steps do not match the compact transcript.')
+                raise _ReplayError('Antigravity companion steps do not match the compact transcript.')
             if compact.warnings != full.warnings or not compact.warnings <= PAIRABLE_CAPTURE_WARNINGS:
                 raise _unsupported('Antigravity companion contains incomplete steps.')
             if compact.revision != original.revision:

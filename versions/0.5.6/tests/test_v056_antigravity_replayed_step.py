@@ -257,19 +257,32 @@ class AntigravityReplayedStepAdapterTests(unittest.TestCase):
                     self.reader.snapshot(self.thread)
                 self.assertEqual(caught.exception.code, 'unsupported_format')
 
-        # One-sided replay ONLY in transcript_full.jsonl must also fail closed in both
-        # truncated-compact and intact-compact cases (never fall back to partial or silent full coverage).
+        # One-sided replay ONLY in transcript_full.jsonl must also fail closed even when
+        # compact has a truncated reply, intact reply, or a preceding forward gap before the replay.
         intact_answer = synthetic.step(2, 'PLANNER_RESPONSE', 'MODEL', 'Head中间Tail')
-        for name, compact_case in (
-            ('only_full_replay_truncated_compact', [question, compact_running, truncated, later]),
-            ('only_full_replay_intact_compact', [question, compact_running, intact_answer, later]),
+        mutated_full_replay = [
+            question, full_running, recovered_answer, {**full_running, 'status': 'DONE'}, later,
+        ]
+        for name, compact_case, full_case in (
+            ('only_full_replay_truncated_compact', [question, compact_running, truncated, later], full_rows),
+            ('only_full_replay_intact_compact', [question, compact_running, intact_answer, later], full_rows),
+            ('compact_gap_and_full_only_replay', [question, compact_running, later], full_rows),
+            ('compact_gap_and_full_mutated_replay', [question, compact_running, later], mutated_full_replay),
         ):
             with self.subTest(one_sided=name):
                 synthetic.write_steps(self.compact, compact_case)
-                synthetic.write_steps(self.full, full_rows)
+                synthetic.write_steps(self.full, full_case)
                 with self.assertRaises(AccessError) as caught:
                     self.reader.snapshot(self.thread)
                 self.assertEqual(caught.exception.code, 'unsupported_format')
+
+        # Contrast: when compact has a forward gap and NEITHER log has a replay, existing v1
+        # missing_steps partial-coverage semantics remain intact.
+        synthetic.write_steps(self.compact, [question, compact_running, later])
+        synthetic.write_steps(self.full, [question, full_running, recovered_answer, later])
+        gap_only = self.reader.snapshot(self.thread)
+        self.assertEqual([m.text for m in gap_only.messages], ['Question', 'Follow up'])
+        self.assertEqual(gap_only.warnings, ('missing_steps',))
 
         # Single-file transcript (no companion) with replay + incomplete tail still preserves
         # single-file append semantics with incomplete_tail_omitted.
@@ -671,6 +684,12 @@ class AntigravityReplayedStepMCPV1Tests(unittest.TestCase):
                 b'',
             ),
             (
+                'compact_gap_and_full_only_replay',
+                [q1, run_known, q2],
+                [q1, run_known_full, a1_intact, run_known_full, q2],
+                b'',
+            ),
+            (
                 'compact_unterminated_after_replay',
                 [q1, run_known, a1_intact, run_known, q2],
                 [q1, run_known_full, a1_intact, run_known_full, q2],
@@ -699,6 +718,24 @@ class AntigravityReplayedStepMCPV1Tests(unittest.TestCase):
                 self.assertEqual(found['threads'], [], found)
                 self.assertFalse(found['coverage_complete'], found)
                 self.assertIn('unsupported_format', found['coverage'][0]['warnings'], found)
+
+        # Contrast: same compact forward gap WITHOUT any one-sided replay still preserves
+        # existing v1 gap semantics (ready + missing_steps).
+        synthetic.write_steps(self.target_compact, [q1, run_known, q2])
+        synthetic.write_steps(self.target_full, [q1, run_known_full, a1_intact, q2])
+        is_err, found_gap = self.complete('find_agent_threads', {
+            'project_id': 'alpha-project',
+            'source_id': SOURCE_V1,
+            'query': TARGET_TITLE,
+        })
+        self.assertFalse(is_err, found_gap)
+        self.assertEqual(len(found_gap['threads']), 1, found_gap)
+        is_err, read_gap = self.complete('read_agent_thread', {
+            'thread_ref': found_gap['threads'][0]['thread_ref'],
+        })
+        self.assertFalse(is_err, read_gap)
+        self.assertEqual(read_gap['warnings'], ['missing_steps'])
+        self.assertEqual([m['text'] for m in read_gap['entries']], ['First question', 'Second question'])
 
 
 class AntigravityReplayedStepMCPV2Tests(unittest.TestCase):

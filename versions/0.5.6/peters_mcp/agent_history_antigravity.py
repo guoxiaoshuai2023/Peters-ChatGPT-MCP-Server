@@ -197,21 +197,24 @@ class _Transcript:
         self.warnings = set()
         self.replayed_count = 0
         self.replayed_digest = hashlib.sha256()
+        self._prior_index = -1
+        self._line_index = 0
+        self._seen_non_public_digests = {}
 
     @property
     def revision(self):
         return self.digest.hexdigest()
 
     def __iter__(self):
-        prior_index = -1
-        seen_non_public_digests = {}
-        for line_index in range(MAX_RECORDS + 1):
+        while True:
             raw = self.stream.readline(min(MAX_RECORD_BYTES + 1, self.before.st_size - self.consumed))
             self.consumed += len(raw)
             if not raw:
                 break
+            line_index = self._line_index
             if line_index == MAX_RECORDS or len(raw) > MAX_RECORD_BYTES:
                 raise _budget('Antigravity transcript exceeds the reader record limit.')
+            self._line_index += 1
             if not raw.endswith(b'\n'):
                 self.warnings.add('incomplete_tail_omitted')
                 break
@@ -219,10 +222,10 @@ class _Transcript:
             self.committed = self.consumed
             step = _profile_record(raw)
             index, kind, source, status, record = step
-            if index <= prior_index:
+            if index <= self._prior_index:
                 if _is_replayable_non_public_step(kind, source):
                     raw_digest = hashlib.sha256(raw).digest()
-                    if seen_non_public_digests.get(index) == raw_digest:
+                    if self._seen_non_public_digests.get(index) == raw_digest:
                         marker = json.dumps(
                             [line_index, index, kind, source, status, record.get('created_at')],
                             ensure_ascii=True, separators=(',', ':'),
@@ -231,13 +234,13 @@ class _Transcript:
                         self.replayed_count += 1
                         continue
                 raise _ReplayError('Antigravity transcript steps are not strictly ordered.')
-            if index != prior_index + 1:
+            if index != self._prior_index + 1:
                 self.warnings.add('missing_steps')
-            prior_index = index
+            self._prior_index = index
             if _is_replayable_non_public_step(kind, source):
-                seen_non_public_digests[index] = hashlib.sha256(raw).digest()
+                self._seen_non_public_digests[index] = hashlib.sha256(raw).digest()
             yield step
-        if prior_index < 0:
+        if self._prior_index < 0:
             raise AccessError('Antigravity transcript has no committed records yet.', code='waiting_source_stable')
 
 
@@ -636,7 +639,7 @@ class Adapter:
                 raise
             except AccessError as error:
                 if error.code == 'unsupported_format':
-                    if compact.replayed_count > 0 or full.replayed_count > 0:
+                    if original.replayed_count > 0 or compact.replayed_count > 0 or full.replayed_count > 0:
                         raise _ReplayError('Antigravity companion steps do not match the compact transcript.') from None
                     try:
                         for step_no, _ in enumerate(full):

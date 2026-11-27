@@ -10,9 +10,9 @@
 
 | `0.5.6` 候选固定包 | SHA-256 |
 | --- | --- |
-| source content | `7c9467cc3eee85c4810628e7f5f72fc9691e3ddb48cd42ebe928db73bc5b94ec` |
-| candidate（待 L4 复验） | `a3964fc12b0df9285c535eaaa215aa2fb92b9afa6967e8770acc00d6dfceac94` |
-| generated inspection rollback | `6dfcdeb077139176b288fada7498d351e15dd155c971268c19f487d8d2b07a4a` |
+| source content | `14a5a66ce9d9ea476bf8c4c62c5c2a496ec7e9929c4bfe6df7576753fb127757` |
+| candidate（待 L4 复验） | `01201a5122564e34e6f5dedf36104fc1c3751f0c9facd3f9c8c745d25fd2497a` |
+| generated inspection rollback | `3e0afc3e7229ce1e5084ab2fa029d19d1897aa11ff2f05994e6907bdd474a85a` |
 
 [`0.5.5`](0.5.5/AGENT_HISTORY.md) 从 [`0.5.4`](0.5.4/AGENT_HISTORY.md) 派生，定向闭合 macOS `ProcessType=Background`（`taskpolicy -b`）后台调度下大型 Antigravity Desktop 轨迹冷启动步骤超时，以及统一 `v2` 工作进程超时状态报告与撤权保护：
 

@@ -69,7 +69,7 @@
     "requirements.txt",
     "tools/native_receiver_loader.py"
   ],
-  "source_content_fingerprint": "7c9467cc3eee85c4810628e7f5f72fc9691e3ddb48cd42ebe928db73bc5b94ec",
-  "candidate_fingerprint": "a3964fc12b0df9285c535eaaa215aa2fb92b9afa6967e8770acc00d6dfceac94",
-  "rollback_fingerprint": "6dfcdeb077139176b288fada7498d351e15dd155c971268c19f487d8d2b07a4a"
+  "source_content_fingerprint": "14a5a66ce9d9ea476bf8c4c62c5c2a496ec7e9929c4bfe6df7576753fb127757",
+  "candidate_fingerprint": "01201a5122564e34e6f5dedf36104fc1c3751f0c9facd3f9c8c745d25fd2497a",
+  "rollback_fingerprint": "3e0afc3e7229ce1e5084ab2fa029d19d1897aa11ff2f05994e6907bdd474a85a"
 }

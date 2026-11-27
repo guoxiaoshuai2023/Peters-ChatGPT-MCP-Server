@@ -34,44 +34,29 @@ jobs:
 
       - name: Run synthetic unit and security regression suite (versions/0.5.5)
         working-directory: versions/0.5.5
+        shell: bash
         run: |
-          PYTHONDONTWRITEBYTECODE=1 python -B - <<'PY'
-          import sys
-          import unittest
-          from pathlib import Path
-
-          # Exclude only the 5 bare-metal sub-100ms wall-clock / RSS-allocator timing modules
-          # that experience noisy-neighbor jitter on shared hosted macOS VMs; they remain
-          # mandatory in bare-metal macOS pre-release verification (`unittest discover -s tests`).
-          HOSTED_VM_TIMING_MODULES = {
-              "test_file_source.py",
-              "test_history_limits.py",
-              "test_history_process.py",
-              "test_owner_rehearsal_infrastructure.py",
-              "test_v055_background_qos_and_timeout_recovery.py",
-          }
-
-          sys.path.insert(0, str(Path.cwd().resolve()))
-          sys.path.insert(0, str((Path.cwd() / "tests").resolve()))
-          loader = unittest.TestLoader()
-          suite = unittest.TestSuite()
-          test_files = sorted(p for p in Path("tests").glob("test_*.py") if p.name not in HOSTED_VM_TIMING_MODULES)
-          for tf in test_files:
-              suite.addTests(loader.loadTestsFromName(f"tests.{tf.stem}"))
-          # Still include the 3 deterministic v0.5.5 background-QoS & revocation tests
-          for method in (
-              "test_capture_iter_emits_multiple_cooperative_scanning_checkpoints",
-              "test_background_qos_cold_large_antigravity_find_and_full_read_without_step_timeout",
-              "test_v2_revocation_blocks_timeout_and_stale_cursors_without_status_or_data_leak",
-          ):
-              suite.addTests(loader.loadTestsFromName(
-                  f"tests.test_v055_background_qos_and_timeout_recovery.BackgroundQosAndTimeoutRecoveryTests.{method}"
-              ))
-          print(f"Loaded {suite.countTestCases()} deterministic tests across {len(test_files) + 1} modules.")
-          result = unittest.TextTestRunner(verbosity=2).run(suite)
-          if not result.wasSuccessful():
-              raise SystemExit(1)
-          PY
+          set -euo pipefail
+          # Exclude only the 5 bare-metal micro-timing / RSS-allocator modules on shared
+          # hosted macOS VMs; they remain mandatory in bare-metal pre-release verification.
+          TARGETS=()
+          for f in tests/test_*.py; do
+            base="$(basename "$f" .py)"
+            case "$base" in
+              test_file_source|test_history_limits|test_history_process|test_owner_rehearsal_infrastructure|test_v055_background_qos_and_timeout_recovery)
+                continue
+                ;;
+            esac
+            TARGETS+=("$base")
+          done
+          # Still run the 3 deterministic v0.5.5 background-QoS & revocation tests
+          TARGETS+=(
+            "test_v055_background_qos_and_timeout_recovery.BackgroundQosAndTimeoutRecoveryTests.test_capture_iter_emits_multiple_cooperative_scanning_checkpoints"
+            "test_v055_background_qos_and_timeout_recovery.BackgroundQosAndTimeoutRecoveryTests.test_background_qos_cold_large_antigravity_find_and_full_read_without_step_timeout"
+            "test_v055_background_qos_and_timeout_recovery.BackgroundQosAndTimeoutRecoveryTests.test_v2_revocation_blocks_timeout_and_stale_cursors_without_status_or_data_leak"
+          )
+          echo "Running ${#TARGETS[@]} deterministic unittest targets via python -m unittest..."
+          PYTHONPATH=".:tests" PYTHONDONTWRITEBYTECODE=1 python -B -m unittest -v "${TARGETS[@]}"
 
       - name: Verify reproducible candidate & rollback build fingerprints
         working-directory: versions/0.5.5

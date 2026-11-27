@@ -2,6 +2,18 @@
 
 **当前正式稳定维护基线：[`v0.5.5`](0.5.5/AGENT_HISTORY.md)**（正式 Tag `v0.5.5`，冻结源码提交 `b20a5891e3b5047cd6fc261f28223004de84fee0`；维护入口见 [MAINTAINING.md](../MAINTAINING.md)）
 
+**最新修复候选：[`0.5.6`](0.5.6/AGENT_HISTORY.md)**（从冻结的 `0.5.5` 派生，尚待独立 L4 复验及生产主机现场验证，未替代当前正式基线 `v0.5.5`）：
+
+- **Antigravity 非公开旧步骤逐字节原样重放去重**：当 Antigravity 在后续日志行中逐字节原样重写先前已提交且**来源可识别**的非公开状态记录（`USER_INPUT`/`PLANNER_RESPONSE` 仅限 `SYSTEM`/`SYSTEM_SDK`/`USER_IMPLICIT`，其余非公开类型仅限 `MODEL`/`SYSTEM`/`SYSTEM_SDK`/`USER_IMPLICIT`）时，`_Transcript.__iter__` 通过该步骤的精确原始行 SHA-256 摘要识别并跳过重复行，使已授权会话不再在 `find_agent_threads` 标题搜索中因 `unsupported_format` 消失；同时不推进 `prior_index`，完整保留真实向前跳号 `missing_steps`、`unfinished_messages_omitted`、全文件原始字节 `revision` 指纹、单文件追加 `prefix` 校验与 `MAX_RECORDS` 资源上限。任何同编号但状态/内容/来源/时间戳/字节编码不同的修改、任何公开角色（`USER_INPUT`/`USER_EXPLICIT`、`PLANNER_RESPONSE`/`MODEL`）或未知来源重放、以及首次出现即落入旧编号范围的记录，均保持 fail-closed 拒读（`unsupported_format`）。
+- **双日志重放双向对称交叉核验**：只要伴生 `transcript_full.jsonl` 存在，`_snapshot_iter` 即对精简日志与完整日志执行双向对称重放核验（`_recover_iter`），要求两份日志各自内部逐字节原样重放且在完全相同行位记录一致的 `[line_index, step_index, type, source, status, created_at]` 摘要（允许非公开记录正文在精简/完整日志间存在压缩差异）；任一侧缺失重放（无论精简日志是否截断）、行位错位、或双日志重放场景下任一侧存在未提交残缺尾行均 fail-closed（`v1` 报 `unsupported_format`，`v2` 报 `association_unverified`），无伴生日志的单文件追加语义保持不变。
+- **当前验收状态**：已完成合成单元测试、安全边界测试、`v1`/`v2` MCP 标题搜索与 `next_cursor` 分页读取回归及双次独立复构校验；候选包暂不放行生产，待独立 L4 复验与现场复查完成后另行评审。[候选构建清单](0.5.6/BUILD_SPEC.json)
+
+| `0.5.6` 候选固定包 | SHA-256 |
+| --- | --- |
+| source content | `14a5a66ce9d9ea476bf8c4c62c5c2a496ec7e9929c4bfe6df7576753fb127757` |
+| candidate（待 L4 复验） | `01201a5122564e34e6f5dedf36104fc1c3751f0c9facd3f9c8c745d25fd2497a` |
+| generated inspection rollback | `3e0afc3e7229ce1e5084ab2fa029d19d1897aa11ff2f05994e6907bdd474a85a` |
+
 [`0.5.5`](0.5.5/AGENT_HISTORY.md) 从 [`0.5.4`](0.5.4/AGENT_HISTORY.md) 派生，定向闭合 macOS `ProcessType=Background`（`taskpolicy -b`）后台调度下大型 Antigravity Desktop 轨迹冷启动步骤超时，以及统一 `v2` 工作进程超时状态报告与撤权保护：
 
 - **Antigravity 协作式有界步骤让出（后台 QoS 冷启动稳定收敛）**：将 `Adapter._snapshot`、`_recover`、`capture`、`_steps`、`_generations`、关联子 Agent `verify_senders` 与公开消息脱敏 `_record` 拆分为协作式生成器让出点（`capture_iter`、`snapshot_iter`、`snapshot_for_inheritance_iter`、`_record_iter`），完整保留全部 TOCTOU 复采样、SQLite WAL/SHM 一致性校验与 `_CAPTURE_CACHE` 四组物理戳绑定；在正式后台 QoS 下冷启动查找、等待续页、全量分页读取与 `view="latest_turn"` 均在单步监管预算内稳定完成。

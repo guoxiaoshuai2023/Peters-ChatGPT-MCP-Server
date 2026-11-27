@@ -1,4 +1,4 @@
-name: v0.5.5 Verification CI
+name: Verification CI (v0.5.5 baseline & v0.5.6 candidate)
 
 on:
   pull_request:
@@ -14,6 +14,7 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  # Retain required check context name `v055-ci` to match main-protection ruleset.
   v055-ci:
     name: v055-ci
     runs-on: macos-latest
@@ -30,10 +31,10 @@ jobs:
       - name: Install locked dependencies
         run: |
           python -m pip install --upgrade pip
-          python -m pip install -r versions/0.5.5/requirements.lock
+          python -m pip install -r versions/0.5.6/requirements.lock
 
-      - name: Run synthetic unit and security regression suite (versions/0.5.5)
-        working-directory: versions/0.5.5
+      - name: Run synthetic unit and security regression suite (versions/0.5.6)
+        working-directory: versions/0.5.6
         shell: bash
         run: |
           set -euo pipefail
@@ -58,8 +59,7 @@ jobs:
           echo "Running ${#TARGETS[@]} deterministic unittest targets via python -m unittest..."
           PYTHONPATH=".:tests" PYTHONDONTWRITEBYTECODE=1 python -B -m unittest -v "${TARGETS[@]}"
 
-      - name: Verify reproducible candidate & rollback build fingerprints
-        working-directory: versions/0.5.5
+      - name: Verify reproducible candidate & rollback build fingerprints (v0.5.5 frozen & v0.5.6 candidate)
         run: |
           PYTHONDONTWRITEBYTECODE=1 python -B - <<'PY'
           import json
@@ -68,30 +68,32 @@ jobs:
           import tempfile
           from pathlib import Path
 
-          spec = json.loads(Path("BUILD_SPEC.json").read_text(encoding="utf-8"))
-          with tempfile.TemporaryDirectory(prefix="ci-build-") as tmp:
-              out = Path(tmp).resolve() / "release"
-              cmd = [
-                  sys.executable, "-B", "tools/build_file_release.py",
-                  "--source", str(Path.cwd().resolve()),
-                  "--output", str(out),
-                  "--snapshot-id", spec["snapshot_id"],
-              ]
-              for item in spec["include"]:
-                  cmd.extend(["--include", item])
-              built = json.loads(subprocess.check_output(cmd, text=True))
-              assert built["candidate"] == spec["candidate_fingerprint"], built
-              assert built["rollback"] == spec["rollback_fingerprint"], built
-              for mode in ("candidate", "rollback"):
-                  verified = json.loads(subprocess.check_output(
-                      [sys.executable, "-B", "tools/build_file_release.py", "--verify", str(out / mode)],
-                      text=True,
-                  ))
-                  assert verified["bundle_mode"] == mode
-                  assert verified["content_fingerprint"] == built[mode]
-              manifest = json.loads((out / "candidate" / "manifest.json").read_text(encoding="utf-8"))
-              assert manifest["source_content_fingerprint"] == spec["source_content_fingerprint"]
-          print("BUILD_AND_FINGERPRINT_VERIFIED: OK")
+          for version_dir in ("versions/0.5.5", "versions/0.5.6"):
+              src = Path(version_dir).resolve()
+              spec = json.loads((src / "BUILD_SPEC.json").read_text(encoding="utf-8"))
+              with tempfile.TemporaryDirectory(prefix=f"ci-build-{src.name}-") as tmp:
+                  out = Path(tmp).resolve() / "release"
+                  cmd = [
+                      sys.executable, "-B", str(src / "tools/build_file_release.py"),
+                      "--source", str(src),
+                      "--output", str(out),
+                      "--snapshot-id", spec["snapshot_id"],
+                  ]
+                  for item in spec["include"]:
+                      cmd.extend(["--include", item])
+                  built = json.loads(subprocess.check_output(cmd, text=True))
+                  assert built["candidate"] == spec["candidate_fingerprint"], (version_dir, built)
+                  assert built["rollback"] == spec["rollback_fingerprint"], (version_dir, built)
+                  for mode in ("candidate", "rollback"):
+                      verified = json.loads(subprocess.check_output(
+                          [sys.executable, "-B", str(src / "tools/build_file_release.py"), "--verify", str(out / mode)],
+                          text=True,
+                      ))
+                      assert verified["bundle_mode"] == mode
+                      assert verified["content_fingerprint"] == built[mode]
+                  manifest = json.loads((out / "candidate" / "manifest.json").read_text(encoding="utf-8"))
+                  assert manifest["source_content_fingerprint"] == spec["source_content_fingerprint"]
+              print(f"BUILD_AND_FINGERPRINT_VERIFIED ({version_dir}): OK")
           PY
 
       - name: Public repository privacy & bytecode hygiene scan

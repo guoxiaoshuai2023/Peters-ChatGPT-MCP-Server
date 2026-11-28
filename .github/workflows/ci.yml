@@ -1,4 +1,4 @@
-name: Verification CI (v0.5.5 baseline & v0.5.6 candidate)
+name: Verification CI (v0.5.5/v0.5.6 frozen & v0.5.7 candidate)
 
 on:
   pull_request:
@@ -31,10 +31,10 @@ jobs:
       - name: Install locked dependencies
         run: |
           python -m pip install --upgrade pip
-          python -m pip install -r versions/0.5.6/requirements.lock
+          python -m pip install -r versions/0.5.7/requirements.lock
 
-      - name: Run synthetic unit and security regression suite (versions/0.5.6)
-        working-directory: versions/0.5.6
+      - name: Run synthetic unit and security regression suite (versions/0.5.7)
+        working-directory: versions/0.5.7
         shell: bash
         run: |
           set -euo pipefail
@@ -59,7 +59,7 @@ jobs:
           echo "Running ${#TARGETS[@]} deterministic unittest targets via python -m unittest..."
           PYTHONPATH=".:tests" PYTHONDONTWRITEBYTECODE=1 python -B -m unittest -v "${TARGETS[@]}"
 
-      - name: Verify reproducible candidate & rollback build fingerprints (v0.5.5 frozen & v0.5.6 candidate)
+      - name: Verify reproducible candidate & rollback build fingerprints (v0.5.5/v0.5.6 frozen & v0.5.7 candidate)
         run: |
           PYTHONDONTWRITEBYTECODE=1 python -B - <<'PY'
           import json
@@ -68,7 +68,7 @@ jobs:
           import tempfile
           from pathlib import Path
 
-          for version_dir in ("versions/0.5.5", "versions/0.5.6"):
+          for version_dir in ("versions/0.5.5", "versions/0.5.6", "versions/0.5.7"):
               src = Path(version_dir).resolve()
               spec = json.loads((src / "BUILD_SPEC.json").read_text(encoding="utf-8"))
               with tempfile.TemporaryDirectory(prefix=f"ci-build-{src.name}-") as tmp:

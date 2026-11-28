@@ -2,7 +2,19 @@
 
 **当前正式稳定维护基线：[`v0.5.5`](0.5.5/AGENT_HISTORY.md)**（正式 Tag `v0.5.5`，冻结源码提交 `b20a5891e3b5047cd6fc261f28223004de84fee0`；维护入口见 [MAINTAINING.md](../MAINTAINING.md)）
 
-**最新修复候选：[`0.5.6`](0.5.6/AGENT_HISTORY.md)**（从冻结的 `0.5.5` 派生，尚待独立 L4 复验及生产主机现场验证，未替代当前正式基线 `v0.5.5`）：
+**最新修复候选：[`0.5.7`](0.5.7/AGENT_HISTORY.md)**（从冻结的 `0.5.6` 派生，尚待独立 L4 验收及生产主机审批，未替代当前正式基线 `v0.5.5`）：
+
+- **Antigravity Desktop 2.33–2.36 原生轨迹全量字段安全分级审计与统一生命周期不变式**：对 2.33.0–2.36.0 已发布的 `CascadeConfig`、`CascadePlannerConfig`、`DeclarativeComponentConfig`、`CustomizationDiscoveryConfig`、`CascadeToolConfig`、`ExecutorMetadata` 完成一次性全量安全分级；凡可能影响工作区路径、系统提示词、自定义 Agent、工具描述覆盖或外部定制注入的红线字段（如 `CascadeConfig.12`、`CascadePlannerConfig.{2,26,27,36,39,40,41,42,44,54,56}`、`DeclarativeComponentConfig.{1,12}`、`CustomizationDiscoveryConfig.{3..11}`、`CascadeToolConfig.{22,37,47}`、`ExecutorMetadata.{8,14,15}` 及未知未来字段）继续严格 fail-closed；对可证明无安全影响的标量/开关/闭集枚举字段（含 `46.9` `ComponentResolutionPolicy` 闭集 `{1,2}` 及取值 `{0,1,2}`、`61` `response_language`、`57.14` `CustomizationInheritanceMode`、`ExecutorMetadata.{4,5,13,19}` 等）按严格 wire-type 与取值边界放行。统一 `ExecutorTerminationReason` 生命周期不变式（`4=NO_TOOL_CALL` 维持终态回复校验；`{1,2,3,6,7,8,11}` 合法非正常终态仍执行全部安全边界校验并强制 `gen_metadata` 严格调用计数核对，无 field 12 时零未核对跳过；`{0,9,10,12}` 及未知枚举值严格 fail-closed）；支持带显式单调 `started_at`/`completed_at` 且不改变 `CustomAgentSpec` 的运行中插队/打断 `USER_INPUT`；将活跃写入索引滞后（`index_step_count < db_steps_count`）归类为可重试 `waiting_source_stable`；仅在本地只读运维诊断 `inspect_native` 输出精确拒绝字段/位置（对外 MCP 保持固定不透明错误码、零泄露），并允许 `IDLE` 已验会话复用既有四组物理戳 `_CAPTURE_CACHE`。
+- **统一入口 `find_agent_threads` 两阶段检索、`v1`/`v2` 对齐与单槽 `busy` 消除**：将 `AgentHistoryCore._search` 重构为 `v1`/`v2` 一致的两阶段检索——标题/元数据命中候选在独立预算（`MAX_TITLE_SEARCH = 256`）内优先完成完整授权核验与返回，与按 `updated_at DESC` 排序的有界正文深扫（`MAX_SEARCH = 256` / `64 MiB` / 有标题命中时 `4.0 s`、无标题命中时 `12.0 s`）解耦；移除 `v1` 专属 25 秒墙钟硬截断与未过滤索引截断，消除 Codex `_legacy_record` 双次文件扫描，并将 `AgentHistoryService` 单来源工作进程并发槽位提升至 `3` 且在 `_abandon` 时按精确游标释放单任务（`IsolatedHistory.forget_cursor`），在 300+ 线程大项目下稳定命中精确标题并保持诚实 `coverage_complete`/`resource_exhausted` 报告与翻页中途撤权 fail-closed。
+- **当前验收状态**：已完成合成安全边界/对抗测试、320 线程 `v1`/`v2` 大项目与并发/撤权测试、完整 bare-metal 回归套件及双次干净构建校验；候选包暂不放行生产，待独立 L4 验收与正式审批后决定切流。[候选构建清单](0.5.7/BUILD_SPEC.json)
+
+| `0.5.7` 候选固定包 | SHA-256 |
+| --- | --- |
+| source content | `a683807e33126de24d16e0c86b22a9a94c44898bbba2078dc4ac0417632faf89` |
+| candidate（待 L4 验收） | `bcabd6ff83f7ba9d4e7e84d3a920c553fc56a5d5f44b411d41a7a196a9e5e364` |
+| generated inspection rollback | `b127523061cfc1b588d4c99337317fad0618882d973d3ed4108b17971770cb68` |
+
+**冻结历史修复快照：[`0.5.6`](0.5.6/AGENT_HISTORY.md)**（从冻结的 `0.5.5` 派生并已完成 L4 独立复验与双机部署，源码保持冻结不变）：
 
 - **Antigravity 非公开旧步骤逐字节原样重放去重**：当 Antigravity 在后续日志行中逐字节原样重写先前已提交且**来源可识别**的非公开状态记录（`USER_INPUT`/`PLANNER_RESPONSE` 仅限 `SYSTEM`/`SYSTEM_SDK`/`USER_IMPLICIT`，其余非公开类型仅限 `MODEL`/`SYSTEM`/`SYSTEM_SDK`/`USER_IMPLICIT`）时，`_Transcript.__iter__` 通过该步骤的精确原始行 SHA-256 摘要识别并跳过重复行，使已授权会话不再在 `find_agent_threads` 标题搜索中因 `unsupported_format` 消失；同时不推进 `prior_index`，完整保留真实向前跳号 `missing_steps`、`unfinished_messages_omitted`、全文件原始字节 `revision` 指纹、单文件追加 `prefix` 校验与 `MAX_RECORDS` 资源上限。任何同编号但状态/内容/来源/时间戳/字节编码不同的修改、任何公开角色（`USER_INPUT`/`USER_EXPLICIT`、`PLANNER_RESPONSE`/`MODEL`）或未知来源重放、以及首次出现即落入旧编号范围的记录，均保持 fail-closed 拒读（`unsupported_format`）。
 - **双日志重放双向对称交叉核验**：只要伴生 `transcript_full.jsonl` 存在，`_snapshot_iter` 即对精简日志与完整日志执行双向对称重放核验（`_recover_iter`），要求两份日志各自内部逐字节原样重放且在完全相同行位记录一致的 `[line_index, step_index, type, source, status, created_at]` 摘要（允许非公开记录正文在精简/完整日志间存在压缩差异）；任一侧缺失重放（无论精简日志是否截断）、行位错位、或双日志重放场景下任一侧存在未提交残缺尾行均 fail-closed（`v1` 报 `unsupported_format`，`v2` 报 `association_unverified`），无伴生日志的单文件追加语义保持不变。

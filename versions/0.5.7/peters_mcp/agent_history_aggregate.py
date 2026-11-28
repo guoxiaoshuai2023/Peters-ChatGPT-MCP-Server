@@ -8,7 +8,9 @@ import secrets
 import threading
 import time
 
-from .agent_history import ERROR_CODES, VERSION, _restart, coverage_status, unified
+from .agent_history import (
+    ERROR_CODES, VERSION, _normalize_query, _restart, _search_rank_key, coverage_status, unified,
+)
 from .agent_history_policy import AGENT, IDENTIFIER
 from .catalog import AccessError, integer
 from .history_process import bound_worker_replies
@@ -167,7 +169,8 @@ def _coverage(value, source):
     return result
 
 
-def _merge(groups):
+def _merge(groups, query=""):
+    needle = _normalize_query(query.strip()) if query else ""
     matches = {}
     for hits in groups.values():
         for hit in hits:
@@ -175,6 +178,10 @@ def _merge(groups):
     rows = []
     for same in matches.values():
         best = min(same, key=lambda hit: (
+            not (bool(needle) and hit.summary["match"].get("in") == "title"
+                 and _normalize_query((hit.summary.get("title") or "").strip()) == needle),
+            not (bool(needle) and hit.summary["match"].get("in") == "title"
+                 and hit.summary["match"].get("mode") != "token_all"),
             hit.summary["match"].get("mode") == "token_all",
             not hit.primary,
             hit.summary["source_id"],
@@ -183,11 +190,7 @@ def _merge(groups):
         sources = sorted({hit.summary["source_id"] for hit in same})
         vouchers = tuple(sorted({voucher for hit in same for voucher in hit.vouchers}))
         rows.append(({**best.summary, "matched_sources": sources}, vouchers))
-    rows.sort(key=lambda item: (
-        item[0]["match"].get("mode") != "token_all",
-        item[0]["updated_at"],
-        item[0]["stable_thread_id"],
-    ), reverse=True)
+    rows.sort(key=lambda item: _search_rank_key(item[0], needle), reverse=True)
     return rows
 
 
@@ -439,7 +442,7 @@ class AggregateFind:
                 if state.scans:
                     return self._continuation(state, scope, params)
             if state.ordered is None:
-                state.ordered = _merge(state.hits)
+                state.ordered = _merge(state.hits, query=query)
             end = min(len(state.ordered), state.offset + (state.page_limit or limit))
             page = state.ordered[state.offset:end]
             if state.validation is None:

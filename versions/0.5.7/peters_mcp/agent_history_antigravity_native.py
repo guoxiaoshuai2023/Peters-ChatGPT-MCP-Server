@@ -27,6 +27,7 @@ import json
 import os
 import re
 import struct
+import unicodedata
 
 from .agent_history_source import _stamp
 from .catalog import AccessError
@@ -55,8 +56,15 @@ NORMAL_TERMINATION_REASON = 4
 # and any unknown enum value remain strictly fail-closed.
 NON_NORMAL_TERMINATION_REASONS = frozenset({1, 2, 3, 6, 7, 8, 11})
 RESOLUTION_POLICY_VALUES = frozenset({0, 1, 2})
-CUSTOMIZATION_INHERITANCE_MODES = frozenset({0, 1, 2, 3})
-SENSITIVITY_LEVELS = frozenset({0, 100, 200, 300, 400, 500, 600, 700})
+# .exa.cortex_pb.CustomizationInheritanceMode (2.36+): allow only UNSPECIFIED (0)
+# and NONE (2); ALL (1) and REPO_AND_ORG (3) remain fail-closed until org-level
+# inheritance provenance is independently verified.
+CUSTOMIZATION_INHERITANCE_MODES = frozenset({0, 2})
+# .exa.cortex_pb.SensitivityLevel (ExecutorMetadata.19): allow UNSPECIFIED (0) and
+# STANDARD (1); REDACTED (2), RESTRICTED (3), and any unknown values remain
+# strictly fail-closed so elevated-sensitivity turns are never delivered externally.
+SAFE_SENSITIVITY_LEVELS = frozenset({0, 1})
+NON_ZERO_INVOCATION_TERMINATIONS = frozenset({3, 6, 7, 8, 11})
 
 
 def _gen_blob_limit():
@@ -345,7 +353,12 @@ def _check_response_language(raw, path):
     except UnicodeError:
         raise EvidenceIssue('native_lineage_or_workspace_override', path) from None
     require(
-        all(ord(ch) >= 0x20 and ord(ch) != 0x7f and ch not in _RESPONSE_LANG_FORBIDDEN for ch in text),
+        all(
+            unicodedata.category(ch)[0] != 'C'
+            and unicodedata.category(ch) not in ('Zl', 'Zp')
+            and ch not in _RESPONSE_LANG_FORBIDDEN
+            for ch in text
+        ),
         'native_lineage_or_workspace_override',
         path,
     )
@@ -363,6 +376,8 @@ def _check_model_or_alias(raw, path):
     if raw is None:
         return
     cfg = Fields(raw, {1, 2}, allowed={1, 2}, path=path)
+    require(not (1 in cfg.selected and 2 in cfg.selected),
+            'native_lineage_or_workspace_override', f'{path}.oneof')
     for number in (1, 2):
         _check_int32_field(cfg, number, path)
 
@@ -762,6 +777,9 @@ def _steps_iter(db, trajectory, native_id, count, messages, digest, birth, *, is
             and completed_raw is not None
         )
         if is_mid_run_user:
+            interrupting = meta.one(33, 0)
+            if interrupting is not None:
+                require(interrupting in (0, 1), 'native_format_unverified', f'steps[{idx}].33={interrupting}')
             started_at = _epoch(started_raw)
             completed_at = _epoch(completed_raw)
             require(
@@ -771,9 +789,9 @@ def _steps_iter(db, trajectory, native_id, count, messages, digest, birth, *, is
             )
             step_completed = _step_completion(meta, kind, status, created_at)
             require(
-                step_completed >= last_created,
+                step_completed >= last_created and step_completed >= last_commit,
                 'native_step_time_mismatch',
-                f'steps[{idx}].mid_run_user_commit<last_created',
+                f'steps[{idx}].mid_run_user_commit<prior',
             )
             last_created = max(last_created, created_at)
         else:
@@ -942,7 +960,7 @@ def _executors(db, steps, specs, tools, digest, *, is_running=False):
         for number in (4, 13):
             _check_bool_field(value, number, exec_path)
         _check_int32_field(value, 5, exec_path, maximum=len(steps))
-        _check_enum_field(value, 19, SENSITIVITY_LEVELS, exec_path)
+        _check_enum_field(value, 19, SAFE_SENSITIVITY_LEVELS, exec_path)
         key = _uuid(value.one(9))
         count = value.one(2, 0, 0)
         end_pos = value.one(3, 0, 0)
@@ -1081,8 +1099,9 @@ def _generations_iter(db, steps, generated, wrapped, expected, tools, digest, *,
                     f'executor.invocations(status=1,exp={exp_count},ok={counts[key]},err={err_counts[key]})',
                 )
             elif exec_status in NON_NORMAL_TERMINATION_REASONS:
+                min_invocations = 1 if exec_status in NON_ZERO_INVOCATION_TERMINATIONS else 0
                 require(
-                    counts[key] <= exp_count <= counts[key] + err_counts[key],
+                    exp_count >= min_invocations and counts[key] <= exp_count <= counts[key] + err_counts[key],
                     'native_invocations_mismatch',
                     f'executor.invocations(status={exec_status},exp={exp_count},ok={counts[key]},err={err_counts[key]})',
                 )

@@ -57,8 +57,10 @@ def _finish(iterator):
 
 
 class AntigravityNativeSchemaAndLifecycleTests(unittest.TestCase):
-    def _fixture(self):
+    def _fixture(self, *, live_clock=False):
         fx = native.AntigravityNativeTests(methodName='runTest')
+        if live_clock:
+            fx.live_clock = True
         fx.setUp()
         self.addCleanup(fx.doCleanups)
         return fx
@@ -116,11 +118,12 @@ class AntigravityNativeSchemaAndLifecycleTests(unittest.TestCase):
     def test_audited_harmless_233_to_236_fields_validate_strictly(self):
         fx = self._fixture()
         # Valid audited harmless fields across CascadeConfig, CascadePlannerConfig,
-        # CustomizationDiscoveryConfig (2.36 field 14), CascadeToolConfig, and ExecutorMetadata.
+        # CustomizationDiscoveryConfig (2.36 field 14 restricted to UNSPECIFIED/NONE),
+        # CascadeToolConfig, and ExecutorMetadata (.exa.cortex_pb.SensitivityLevel).
         media = message((1, 2048), (2, 1048576), (3, 85), (4, 65536))
-        model_or_alias = message((1, 42), (2, 1))
+        model_or_alias = message((1, 42))
         plan_exec = message((1, 42))
-        disc = message((14, 3))  # CUSTOMIZATION_INHERITANCE_MODE_REPO_AND_ORG
+        disc = message((14, 2))  # CUSTOMIZATION_INHERITANCE_MODE_NONE
         tools = message((29, 1), (43, 30), (46, 0), (49, 0), (50, 1), (51, 1))
         planner = message(
             (13, tools),
@@ -136,22 +139,29 @@ class AntigravityNativeSchemaAndLifecycleTests(unittest.TestCase):
         )
         cfg = message((1, planner), (6, 1), (8, 1), (10, 1), (14, media))
         resolution = message((1, desktop_spec()), (3, b''))
-        exec_blob = message(
-            (1, 4), (2, 1), (3, 1), (4, 1), (5, 0), (9, FIRST),
-            (10, cfg), (13, 0), (16, resolution), (19, 700),
-        )
-        fx.db.execute('UPDATE executor_metadata SET data=? WHERE idx=0', (exec_blob,))
-        fx.db.commit()
-        obs = fx.result()
-        self.assertEqual(obs.state, 'workspace_verified', obs)
+        # .exa.cortex_pb.SensitivityLevel: 0 (UNSPECIFIED) and 1 (STANDARD) MUST pass!
+        for safe_level in (0, 1):
+            with self.subTest(sensitivity_level=safe_level):
+                exec_blob = message(
+                    (1, 4), (2, 1), (3, 1), (4, 1), (5, 0), (9, FIRST),
+                    (10, cfg), (13, 0), (16, resolution), (19, safe_level),
+                )
+                fx.db.execute('UPDATE executor_metadata SET data=? WHERE idx=0', (exec_blob,))
+                fx.db.commit()
+                obs = fx.result()
+                self.assertEqual(obs.state, 'workspace_verified', obs)
 
-        # Invalid scalar bounds/wire-types on audited fields MUST fail closed.
+        # Invalid scalar bounds/wire-types/oneof/org-inheritance on audited fields MUST fail closed.
         invalid_cases = [
             ('bad_bool_cc6', message((6, 2))),
             ('bad_media_extra', message((14, message((5, 1))))),
-            ('bad_disc_enum', message((1, message((57, message((14, 4))))))),
+            ('bad_model_dual_oneof', message((1, message((15, message((1, 42), (2, 1))))))),
+            ('bad_disc_all_1', message((1, message((57, message((14, 1))))))),
+            ('bad_disc_org_3', message((1, message((57, message((14, 3))))))),
+            ('bad_disc_enum_4', message((1, message((57, message((14, 4))))))),
             ('bad_lang_path', message((1, message((61, '/etc/passwd'))))),
             ('bad_lang_ctrl', message((1, message((61, 'en-US\n<SYSTEM>'))))),
+            ('bad_lang_unicode_bidi', message((1, message((61, 'en-US\u202e'))))),
             ('bad_lang_long', message((1, message((61, 'a' * 65))))),
             ('bad_lang_utf8', message((1, message((61, b'\xff\xfe'))))),
             ('bad_tool_bool', message((1, message((13, message((49, 2))))))),
@@ -164,13 +174,124 @@ class AntigravityNativeSchemaAndLifecycleTests(unittest.TestCase):
                 self.assertEqual(obs.state, 'unverified')
                 self.assertTrue(obs.detail, f'expected diagnostic detail for {label}')
 
-        # Invalid SensitivityLevel on ExecutorMetadata.19 MUST fail closed.
-        bad_sens = message((1, 4), (2, 1), (3, 1), (9, FIRST), (16, resolution), (19, 50))
-        fx.db.execute('UPDATE executor_metadata SET data=? WHERE idx=0', (bad_sens,))
-        fx.db.commit()
-        obs = fx.result()
-        self.assertEqual(obs.state, 'unverified')
-        self.assertIn('executor[0].19', obs.detail)
+        # Elevated sensitivity (2=REDACTED, 3=RESTRICTED) and wrong-namespace values
+        # (50, 100, 700) on ExecutorMetadata.19 MUST fail closed with zero detail leak.
+        for blocked_level in (2, 3, 50, 100, 700):
+            with self.subTest(blocked_sensitivity=blocked_level):
+                bad_sens = message((1, 4), (2, 1), (3, 1), (9, FIRST), (16, resolution), (19, blocked_level))
+                fx.db.execute('UPDATE executor_metadata SET data=? WHERE idx=0', (bad_sens,))
+                fx.db.commit()
+                obs = fx.result()
+                self.assertEqual(obs.state, 'unverified')
+                self.assertIn(f'executor[0].19={blocked_level}', obs.detail)
+                with self.assertRaises(AccessError) as exc:
+                    fx.reader.snapshot_for_inheritance(fx.thread)
+                self.assertEqual(exc.exception.code, 'association_unverified')
+                self.assertNotIn('executor[0].19', str(exc.exception))
+
+    def test_v2_http_antigravity_sensitivity_standard_reads_and_redacted_restricted_fail_closed(self):
+        fx = self._fixture(live_clock=True)
+        base = fx.project.parent
+        control = base / 'v2-sens-control'
+        control.mkdir(mode=0o700)
+        ag_root = fx.db_path.parent.parent
+        settings = AccessSettings(
+            'https://test-team.cloudflareaccess.com', 'a' * 64,
+            'mcp.example.com', ('owner@example.com',),
+        )
+        key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+        now = int(time.time())
+        token = jwt.encode(
+            {'iss': settings.team_domain, 'aud': [settings.audience], 'iat': now - 1,
+             'exp': now + 300, 'email': 'owner@example.com', 'sub': 'owner'},
+            key, algorithm='RS256', headers={'kid': 'v057-sens-key'},
+        )
+        store = initialize_store(control / 'generations')
+        desc = control / 'policy.json'
+        doc = {
+            'version': 2,
+            'projects': [
+                {'id': 'alpha', 'name': 'Alpha', 'root': str(fx.project),
+                 'directory_identity': persistent_identity(fx.project)},
+            ],
+            'sources': {
+                'antigravity': {
+                    'adapter': 'antigravity', 'root': str(ag_root), 'format': '2.33.0',
+                    'enabled': True, 'instance_id': 'ag-inst',
+                    'root_identity': persistent_identity(ag_root),
+                },
+            },
+            'legacy_history': None,
+        }
+        pv, dg = preview_activation(doc)
+        activate_preview(store, pv, dg, initial=True)
+        write_descriptor(desc, store)
+        policy = AgentPolicy(desc, mode='v2')
+        scratch = control / 'scratch'
+        scratch.mkdir(mode=0o700)
+        policy.scratch = scratch
+        app = build_app(Catalog.from_policy(policy), settings, agent_policy=policy)
+        app.verifier.keys = Mock()
+        app.verifier.keys.get_signing_key_from_jwt.return_value = SimpleNamespace(key=key.public_key())
+
+        def call_ready(client, name, args):
+            cur = dict(args)
+            for idx in range(40):
+                resp = client.post(
+                    '/mcp',
+                    headers={
+                        'Accept': 'application/json, text/event-stream',
+                        'MCP-Protocol-Version': '2025-03-26',
+                        'cf-access-jwt-assertion': token,
+                    },
+                    json={'jsonrpc': '2.0', 'id': idx + 1, 'method': 'tools/call',
+                          'params': {'name': name, 'arguments': cur}},
+                )
+                self.assertEqual(resp.status_code, 200, resp.text)
+                res = resp.json()['result']
+                page = json.loads(res['content'][0]['text'])
+                if page.get('status') != 'processing':
+                    return page
+                cur = {**args, 'cursor': page['next_cursor']}
+                time.sleep(0.01)
+            self.fail(f'{name} did not finish')
+
+        resolution = message((1, desktop_spec()), (3, b''))
+        with TestClient(app, base_url='https://mcp.example.com') as client:
+            # 1. STANDARD (1) on ExecutorMetadata.19 MUST find and read all 4 messages via v2 HTTP!
+            fx.db.execute(
+                'UPDATE executor_metadata SET data=? WHERE idx=0',
+                (message((1, 4), (2, 1), (3, 1), (9, FIRST), (16, resolution), (19, 1)),),
+            )
+            fx.db.commit()
+            found = call_ready(client, 'find_agent_threads', {
+                'project_id': 'alpha', 'source_id': 'antigravity',
+                'query': 'Synthetic two-turn UI thread', 'limit': 5,
+            })
+            self.assertEqual(found['status'], 'ready', found)
+            self.assertTrue(found['coverage_complete'], found)
+            self.assertEqual(len(found['threads']), 1, found)
+            read = call_ready(client, 'read_agent_thread', {
+                'thread_ref': found['threads'][0]['thread_ref'],
+            })
+            self.assertEqual(read['status'], 'ready', read)
+            self.assertEqual(len(read['entries']), 4)
+
+            # 2. REDACTED (2) and RESTRICTED (3) MUST return 0 hits + association_unverified!
+            for blocked in (2, 3):
+                fx.db.execute(
+                    'UPDATE executor_metadata SET data=? WHERE idx=0',
+                    (message((1, 4), (2, 1), (3, 1), (9, FIRST), (16, resolution), (19, blocked)),),
+                )
+                fx.db.commit()
+                denied = call_ready(client, 'find_agent_threads', {
+                    'project_id': 'alpha', 'source_id': 'antigravity',
+                    'query': 'Synthetic two-turn UI thread', 'limit': 5,
+                })
+                self.assertEqual(denied['threads'], [], (blocked, denied))
+                self.assertFalse(denied['coverage_complete'])
+                self.assertEqual(denied['coverage'][0]['state'], 'association_unverified')
+                self.assertNotIn('executor[0].19', json.dumps(denied))
 
     def test_all_redline_and_unknown_fields_remain_strictly_fail_closed_with_private_diagnostics(self):
         fx = self._fixture()
@@ -262,6 +383,21 @@ class AntigravityNativeSchemaAndLifecycleTests(unittest.TestCase):
         self.assertEqual(obs.state, 'unverified')
         self.assertEqual(obs.reason, 'native_invocations_mismatch')
         self.assertIn('exp=2,ok=0,err=1', obs.detail)
+
+        # Zero-invocation status in {3, 6, 7, 8, 11} without field 12 MUST fail closed!
+        fx.db.execute('DELETE FROM gen_metadata WHERE idx=2')
+        for non_zero_status in (3, 6, 7, 8, 11):
+            with self.subTest(zero_inv_status=non_zero_status):
+                zero_exec = message((1, non_zero_status), (2, 0), (3, 4), (9, third_exec), (16, resolution))
+                fx.db.execute('INSERT OR REPLACE INTO executor_metadata VALUES(2,?)', (zero_exec,))
+                fx.db.commit()
+                self.assertEqual(fx.result().reason, 'native_invocations_mismatch')
+        # Restore gen_metadata[2] for remaining assertions.
+        fx.db.execute(
+            'INSERT INTO gen_metadata VALUES(2,?)',
+            (message((2, b''), (4, third_exec), (5, 'canceled')),),
+        )
+        fx.db.commit()
 
         # Status=1 (ERROR) without field 12 AND without any err_counts MUST fail closed!
         fx.db.execute('UPDATE gen_metadata SET data=? WHERE idx=2', (message((2, b''), (4, third_exec)),))
@@ -387,7 +523,8 @@ class AntigravityNativeSchemaAndLifecycleTests(unittest.TestCase):
         for label, kw in (
             ('missing_times', {'include_times': False}),
             ('before_birth', {'created': SECONDS - 1}),
-            ('commit_before_prev', {'created': SECONDS + 2, 'started': SECONDS + 3, 'completed': SECONDS + 4}),
+            ('commit_before_prev_created', {'created': SECONDS + 2, 'started': SECONDS + 3, 'completed': SECONDS + 4}),
+            ('commit_before_prev_commit', {'created': SECONDS + 3, 'started': SECONDS + 6, 'completed': SECONDS + 7}),
             ('swapped_spec', {'spec': desktop_spec(is_google=1)}),
             ('workspace_override', {'config': message((12, 'file:///other'))}),
         ):
@@ -513,8 +650,10 @@ class LargeProjectTwoPhaseSearchAndConcurrencyTests(unittest.TestCase):
             )
             update_denied = write_v1
         else:
-            store = initialize_store(self.control / 'generations')
-            desc = self.control / 'policy.json'
+            control_dir = Path(tempfile.mkdtemp(dir=self.base, prefix='ctrl-v2-'))
+            os.chmod(control_dir, 0o700)
+            store = initialize_store(control_dir / 'generations')
+            desc = control_dir / 'policy.json'
 
             def write_v2(denied=()):
                 doc = {
@@ -757,6 +896,80 @@ class LargeProjectTwoPhaseSearchAndConcurrencyTests(unittest.TestCase):
             )
         self.assertEqual(after['status'], 'ready')
         self.assertEqual(after['threads'][0]['title'], self.target_title)
+
+    def test_exact_title_ranks_first_despite_280_newer_similar_suffix_titles_across_v1_v2_and_aggregate(self):
+        exact_title = '合成精确标题检索回归主任务'
+        mild_title = 'Synthetic Exact Ranking Title'
+        now_sec = int(time.time())
+        with sqlite3.connect(self.codex_home / 'state_5.sqlite') as db:
+            # 280 newer threads sharing the exact phrase plus distinct suffixes -> exceeds MAX_TITLE_SEARCH=256.
+            for idx in range(280):
+                tid = self.newest_body_id if idx == 5 else f'{idx:08x}-0000-4000-8000-000000000000'
+                db.execute(
+                    'UPDATE threads SET title=?, updated_at=? WHERE id=?',
+                    (f'{exact_title} - 后缀变体 {idx:03d}', now_sec - idx, tid),
+                )
+            # 1 older unique exact-title target (#315) must never be starved or buried behind the 280 suffixes.
+            db.execute(
+                'UPDATE threads SET title=?, updated_at=? WHERE id=?',
+                (exact_title, now_sec - 9000, self.target_id),
+            )
+            # Foreign beta threads with identical exact title must stay isolated.
+            db.execute('UPDATE threads SET title=? WHERE cwd=?', (exact_title, str(self.beta)))
+            # Mild similarity group (< MAX_TITLE_SEARCH) using 24 newer suffix titles + 1 older exact title.
+            for offset in range(24):
+                idx = 280 + offset
+                tid = f'{idx:08x}-0000-4000-8000-000000000000'
+                db.execute(
+                    'UPDATE threads SET title=?, updated_at=? WHERE id=?',
+                    (f'{mild_title} - suffix {offset:02d}', now_sec - 10 - offset, tid),
+                )
+            mild_exact_id = f'{310:08x}-0000-4000-8000-000000000000'
+            db.execute(
+                'UPDATE threads SET title=?, updated_at=? WHERE id=?',
+                (mild_title, now_sec - 8000, mild_exact_id),
+            )
+            db.commit()
+
+        for mode, source_id in (('v1', 'codex'), ('v2', 'codex'), ('v2', '')):
+            with self.subTest(mode=mode, source_id=source_id or 'aggregate'):
+                app, token, _ = self._http_client(mode)
+                with TestClient(app, base_url='https://mcp.example.com') as client:
+                    # 1. 280 newer suffix-collision stress case: exact match MUST be Page 1 index 0.
+                    args = {'project_id': 'alpha', 'query': exact_title, 'limit': 10}
+                    if source_id:
+                        args['source_id'] = source_id
+                    found = self._run_tool_ready(client, token, 'find_agent_threads', args)
+                    self.assertEqual(found['status'], 'ready', found)
+                    self.assertGreaterEqual(len(found['threads']), 1, found)
+                    hit = found['threads'][0]
+                    self.assertEqual(hit['title'], exact_title)
+                    self.assertEqual(hit['project_id'], 'alpha')
+                    self.assertEqual(hit['match'], {'in': 'title', 'mode': 'substring'})
+                    # Coverage remains honest when >256 similar titles hit MAX_TITLE_SEARCH.
+                    self.assertFalse(found['coverage_complete'])
+                    codex_cov = [c for c in found['coverage'] if c['source_id'] == 'codex']
+                    self.assertEqual(len(codex_cov), 1)
+                    self.assertIn('resource_exhausted', codex_cov[0]['warnings'])
+                    # Confirm no foreign beta thread leaked into page 1.
+                    self.assertTrue(all(row['project_id'] == 'alpha' for row in found['threads']))
+                    # Confirm the exact-title hit actually reads the expected #315 messages.
+                    latest = self._run_tool_ready(client, token, 'read_agent_thread', {
+                        'thread_ref': hit['thread_ref'], 'view': 'latest_turn',
+                    })
+                    self.assertEqual(latest['status'], 'ready')
+                    self.assertIn('队列调度策略', latest['entries'][0]['text'])
+                    self.assertIn('预取窗口参数', latest['entries'][1]['text'])
+
+                    # 2. Leading/trailing spaces + case-insensitive mild similarity group: exact match still ranks #1.
+                    mild_args = {'project_id': 'alpha', 'query': f'  {mild_title.lower()}  ', 'limit': 5}
+                    if source_id:
+                        mild_args['source_id'] = source_id
+                    mild = self._run_tool_ready(client, token, 'find_agent_threads', mild_args)
+                    self.assertEqual(mild['status'], 'ready', mild)
+                    self.assertGreaterEqual(len(mild['threads']), 2, mild)
+                    self.assertEqual(mild['threads'][0]['title'], mild_title)
+                    self.assertEqual(mild['threads'][0]['match'], {'in': 'title', 'mode': 'substring'})
 
 
 if __name__ == '__main__':

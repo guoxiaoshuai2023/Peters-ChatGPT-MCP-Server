@@ -14,15 +14,19 @@ revocation, and coverage security boundary strictly fail-closed:
     fields — including `DeclarativeComponentConfig.9`
     (`ComponentResolutionPolicy`, closed `{1, 2}` with enum values strictly in
     `{0: UNSPECIFIED, 1: IGNORE, 2: ERROR}`), `CascadePlannerConfig.61`
-    (`response_language`, validated UTF-8 label `<= 64` bytes with no control or
-    path/tag characters), `CustomizationDiscoveryConfig.14`
-    (`CustomizationInheritanceMode` in `{0, 1, 2, 3}`), `CascadeConfig.{6, 8,
-    10, 14}`, `CascadePlannerConfig.{14, 15, 25, 48, 55, 60}`,
-    `CascadeToolConfig.{29, 49, 51}`, and `ExecutorMetadata.{4, 5, 13, 19}`
-    (`SensitivityLevel` closed set) — are accepted only with strict wire-type,
-    value-range, and closed sub-schema checks. Every redline field capable of
-    altering workspaces, prompts, custom agents, tool descriptions, or
-    injected customizations (`CascadeConfig.12`,
+    (`response_language`, validated UTF-8 label `<= 64` bytes with no Unicode
+    control/format/separator or path/tag characters),
+    `CustomizationDiscoveryConfig.14` (`CustomizationInheritanceMode` strictly
+    restricted to `{0: UNSPECIFIED, 2: NONE}`, keeping `1: ALL` and
+    `3: REPO_AND_ORG` fail-closed), `CascadeConfig.{6, 8, 10, 14}`,
+    `CascadePlannerConfig.{14, 15, 25, 48, 55, 60}` (enforcing `ModelOrAlias`
+    oneof exclusivity), `CascadeToolConfig.{29, 49, 51}`, and
+    `ExecutorMetadata.{4, 5, 13, 19}` (`.exa.cortex_pb.SensitivityLevel`
+    strictly restricted to `{0: UNSPECIFIED, 1: STANDARD}`, keeping
+    `2: REDACTED`, `3: RESTRICTED`, and all unknown values fail-closed) — are
+    accepted only with strict wire-type, value-range, and closed sub-schema
+    checks. Every redline field capable of altering workspaces, prompts, custom
+    agents, tool descriptions, or injected customizations (`CascadeConfig.12`,
     `CascadePlannerConfig.{2, 26, 27, 36, 39, 40, 41, 42, 44, 54, 56}`,
     `DeclarativeComponentConfig.{1, 12}`,
     `CustomizationDiscoveryConfig.{3..11}`, `CascadeToolConfig.{22, 37, 47}`,
@@ -36,15 +40,16 @@ revocation, and coverage security boundary strictly fail-closed:
     `11=MAX_TOKEN_BUDGET_EXCEEDED`) retain full workspace/override/agent-spec/
     MCP/step-contiguity checks and enforce strict `gen_metadata` invocation
     accounting (`counts <= exp <= counts + err_counts` when `execution_error`
-    field `12` is absent, with `err_counts >= 1` required for `ERROR`; zero
-    unaccounted invocations). Hook/injected/chained/unspecified reasons
-    (`0`, `9`, `10`, `12`, and unknown values) remain strictly fail-closed.
+    field `12` is absent, with `err_counts >= 1` required for `ERROR` and
+    `exp >= 1` required for `{3, 6, 7, 8, 11}`; zero unaccounted invocations).
+    Hook/injected/chained/unspecified reasons (`0`, `9`, `10`, `12`, and
+    unknown values) remain strictly fail-closed.
   - Supports mid-execution queued/interrupting `USER_INPUT` steps within an
     active execution only when explicit `started_at` (`32`) and `completed_at`
     (`8`) timestamps prove `birth <= created_at <= started_at <= completed_at`
-    and `step_completed >= last_created`, while preserving full workspace,
-    prompt-hash, transcript-pairing, and identical `CustomAgentSpec`
-    containment checks.
+    and `step_completed >= max(last_created, last_commit)`, while preserving
+    full workspace, prompt-hash, transcript-pairing, and identical
+    `CustomAgentSpec` containment checks.
   - Classifies transient active-write index flush lag
     (`conversation_summaries.step_count < steps` DB row count) as retryable
     `waiting_source_stable` (`native_index_lagging`) without delivering
@@ -58,19 +63,23 @@ revocation, and coverage security boundary strictly fail-closed:
     under the existing four-group live physical-stamp binding (`INDEX`, main DB,
     transcripts, and all related child subagent DBs), avoiding redundant
     multi-child SQLite copies across read pages.
-- **Two-phase unified `find_agent_threads`, `v1`/`v2` alignment, and `busy`
-  elimination (`agent_history.py`, `history.py`, `agent_history_service.py`,
+- **Two-phase unified `find_agent_threads`, exact-title priority, `v1`/`v2`
+  alignment, and `busy` elimination (`agent_history.py`,
+  `agent_history_aggregate.py`, `history.py`, `agent_history_service.py`,
   `history_process.py`)**:
   - Redesigned `AgentHistoryCore._search` into a two-phase pipeline shared
-    consistently across `v1` and `v2`: metadata/title-matching candidates are
-    ranked and verified first under their own decoupled budget
-    (`MAX_TITLE_SEARCH = 256`), ahead of newest-first (`updated_at DESC`)
+    consistently across `v1` and `v2`: exact normalized title matches
+    (tier 0) are ranked and verified ahead of substring title matches
+    (tier 1) and multi-token title matches (tier 2) under their own decoupled
+    budget (`MAX_TITLE_SEARCH = 256`), ahead of newest-first (`updated_at DESC`)
     bounded body deep-scanning (`MAX_SEARCH = 256`, `64 MiB`, `4.0 s` with
-    title hits / `12.0 s` without title hits). Removed the `v1`-only 25-second
-    wall-clock cutoff and raw-index `MAX_SEARCH` truncation so exact title
-    queries reliably hit targets on projects with 300+ threads without dropping
-    honest `coverage_complete=false` / `resource_exhausted` reporting when
-    non-title body scans stop at budget.
+    title hits / `12.0 s` without title hits). Both direct `_search` and
+    aggregate `_scan_agent_source` / `_merge` rank exact normalized title
+    matches ahead of suffix/substring title matches and body hits so an older
+    unique exact title is never crowded out by 256+ newer similar-prefix
+    threads. Removed the `v1`-only 25-second wall-clock cutoff and raw-index
+    `MAX_SEARCH` truncation while preserving honest `coverage_complete=false` /
+    `resource_exhausted` reporting whenever caps are reached.
   - Eliminated double rollout scanning in `_legacy_record` by sharing the
     verified stamp from `transient_projection_iter` (`history.py`) and
     constructing full summaries only on verified matches.

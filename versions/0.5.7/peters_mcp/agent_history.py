@@ -49,17 +49,34 @@ def _query_tokens(needle):
 
 
 def _candidate_title_priority(raw_title, needle, tokens):
-    """Order metadata/title matches ahead of body-only candidates without trusting raw text."""
+    """Order exact normalized title matches ahead of substring, token_all, and body candidates."""
     if not needle:
         return 0
     if not isinstance(raw_title, str) or not raw_title:
-        return 2
-    title_norm = _normalize_query(raw_title)
-    if needle in title_norm:
+        return 3
+    title_norm = _normalize_query(raw_title.strip())
+    if title_norm == needle:
         return 0
-    if len(tokens) >= 2 and all(token in title_norm for token in tokens):
+    if needle in title_norm:
         return 1
-    return 2
+    if len(tokens) >= 2 and all(token in title_norm for token in tokens):
+        return 2
+    return 3
+
+
+def _search_rank_key(summary, needle):
+    """Rank exact normalized title hits ahead of title substring, body substring, and token_all."""
+    match = summary.get("match") or {}
+    match_in = match.get("in")
+    mode = match.get("mode")
+    title_norm = _normalize_query((summary.get("title") or "").strip()) if needle else ""
+    return (
+        bool(needle) and match_in == "title" and title_norm == needle,
+        bool(needle) and match_in == "title" and mode != "token_all",
+        mode != "token_all",
+        summary.get("updated_at") or "",
+        summary.get("stable_thread_id") or "",
+    )
 _LOCAL_PREFIXES = ("/Users", "/home", "/private/var", "/Volumes")
 ABS_PATH = re.compile(r"(?<![\w./])(?:"
                       + "|".join(re.escape(root + "/") for root in _LOCAL_PREFIXES)
@@ -771,7 +788,7 @@ class AgentHistoryCore:
                 for priority, thread in ordered_candidates:
                     try:
                         if needle:
-                            if priority < 2:
+                            if priority < 3:
                                 if title_checked >= MAX_TITLE_SEARCH:
                                     warnings.add("resource_exhausted")
                                     break
@@ -801,7 +818,7 @@ class AgentHistoryCore:
                         )
                         if agent and record.thread.agent.casefold() != agent:
                             continue
-                        if needle and priority < 2:
+                        if needle and priority < 3:
                             title_checked += 1
                         else:
                             body_checked += 1
@@ -842,6 +859,10 @@ class AgentHistoryCore:
         rows = []
         for canonical, found in grouped.items():
             found.sort(key=lambda item: (
+                not (bool(needle) and item[0]["match"].get("in") == "title"
+                     and _normalize_query((item[0].get("title") or "").strip()) == needle),
+                not (bool(needle) and item[0]["match"].get("in") == "title"
+                     and item[0]["match"].get("mode") != "token_all"),
                 item[0]["match"].get("mode") == "token_all",
                 item[0]["source_id"] != canonical[0],
                 item[0]["source_id"],
@@ -854,11 +875,7 @@ class AgentHistoryCore:
             summary["matched_sources"] = sorted(unique)
             rows.append((summary, tuple(unique.values()), _digest(canonical),
                          summary["source_id"] == canonical[0]))
-        rows.sort(key=lambda item: (
-            item[0]["match"].get("mode") != "token_all",
-            item[0]["updated_at"],
-            item[0]["stable_thread_id"],
-        ), reverse=True)
+        rows.sort(key=lambda item: _search_rank_key(item[0], needle), reverse=True)
         return rows, reports
 
     def _find(self, project_id, query, agent, source_id, cursor, limit, actor, policy_actor):

@@ -13,22 +13,27 @@ revocation, or coverage-honesty invariant:
    `CascadeToolConfig`, and `ExecutorMetadata`), strictly validating audited
    harmless scalar/flag/enum/closed-submessage fields (including `46.9`
    `ComponentResolutionPolicy` `{1, 2}` with enum values in `{0, 1, 2}`,
-   2.36 `response_language`, and `CustomizationInheritanceMode`) while keeping
-   all workspace, prompt, custom-agent, tool-override, and customization
-   injection redline fields strictly fail-closed; establishes a unified
-   `ExecutorTerminationReason` invariant with strict `gen_metadata` invocation
-   accounting (zero unverified skipping) and fail-closed rejection of hook/
-   injected/chained/unspecified terminal reasons; supports mid-execution
-   queued/interrupting `USER_INPUT` steps backed by explicit monotonic
-   `started_at`/`completed_at` and matching desktop agent specs; maps transient
-   active-write index flush lag (`index_step_count < db_steps_count`) to
-   retryable `waiting_source_stable`; and adds local-only structural rejection
-   sites to `inspect_native` (`Assessment.detail`) without exposing internal
-   structure over MCP.
+   2.36 `response_language`, `CustomizationInheritanceMode` restricted to
+   `{0: UNSPECIFIED, 2: NONE}`, and `.exa.cortex_pb.SensitivityLevel`
+   restricted to `{0: UNSPECIFIED, 1: STANDARD}` with `2: REDACTED` and
+   `3: RESTRICTED` strictly fail-closed) while keeping all workspace, prompt,
+   custom-agent, tool-override, and customization injection redline fields
+   strictly fail-closed; establishes a unified `ExecutorTerminationReason`
+   invariant with strict `gen_metadata` invocation accounting (zero unverified
+   skipping) and fail-closed rejection of hook/injected/chained/unspecified
+   terminal reasons; supports mid-execution queued/interrupting `USER_INPUT`
+   steps backed by explicit monotonic `started_at`/`completed_at`
+   (`step_completed >= max(last_created, last_commit)`) and matching desktop
+   agent specs; maps transient active-write index flush lag
+   (`index_step_count < db_steps_count`) to retryable `waiting_source_stable`;
+   and adds local-only structural rejection sites to `inspect_native`
+   (`Assessment.detail`) without exposing internal structure over MCP.
 2. **Two-phase unified `find_agent_threads` & concurrent worker non-blocking**:
-   Aligns `v1` and `v2` search under a title/metadata-first, decoupled
-   bounded body-scan pipeline (eliminating the `v1`-only 25-second hard cutoff,
-   `MAX_SEARCH` title starvation on 300+ thread projects, and double Codex
+   Aligns `v1` and `v2` search under a tiered title-first (exact normalized
+   title ahead of substring title, multi-token title, and body hits across
+   direct and aggregate search), decoupled bounded body-scan pipeline
+   (eliminating the `v1`-only 25-second hard cutoff, `MAX_SEARCH` and
+   similar-suffix title starvation on 300+ thread projects, and double Codex
    rollout scanning), raises per-source worker task concurrency to 3 with
    scoped `forget_cursor` cleanup to eliminate single-slot `busy` lockouts, and
    preserves per-thread authorization, mid-read revocation, and honest

@@ -63,23 +63,33 @@ revocation, and coverage security boundary strictly fail-closed:
     under the existing four-group live physical-stamp binding (`INDEX`, main DB,
     transcripts, and all related child subagent DBs), avoiding redundant
     multi-child SQLite copies across read pages.
-- **Two-phase unified `find_agent_threads`, exact-title priority, `v1`/`v2`
+- **Two-phase unified `find_agent_threads`, exact-title priority across all four sources, `v1`/`v2`
   alignment, and `busy` elimination (`agent_history.py`,
-  `agent_history_aggregate.py`, `history.py`, `agent_history_service.py`,
-  `history_process.py`)**:
+  `agent_history_aggregate.py`, `agent_history_deepseek.py`, `history.py`,
+  `agent_history_service.py`, `history_process.py`)**:
   - Redesigned `AgentHistoryCore._search` into a two-phase pipeline shared
     consistently across `v1` and `v2`: exact normalized title matches
     (tier 0) are ranked and verified ahead of substring title matches
     (tier 1) and multi-token title matches (tier 2) under their own decoupled
     budget (`MAX_TITLE_SEARCH = 256`), ahead of newest-first (`updated_at DESC`)
     bounded body deep-scanning (`MAX_SEARCH = 256`, `64 MiB`, `4.0 s` with
-    title hits / `12.0 s` without title hits). Both direct `_search` and
+    title hits / `12.0 s` without title hits), with cooperative discovery
+    yielding during candidate enumeration. Both direct `_search` and
     aggregate `_scan_agent_source` / `_merge` rank exact normalized title
     matches ahead of suffix/substring title matches and body hits so an older
     unique exact title is never crowded out by 256+ newer similar-prefix
     threads. Removed the `v1`-only 25-second wall-clock cutoff and raw-index
     `MAX_SEARCH` truncation while preserving honest `coverage_complete=false` /
     `resource_exhausted` reporting whenever caps are reached.
+  - Updated `agent_history_deepseek.Adapter._describe_at` to extract the latest
+    committed native `session/title` event during discovery for both plain
+    `session.v4.jsonl` and compressed `session.v4.jsonl.zstd` logs (ignoring
+    uncommitted trailing lines/frames, skipping foreign/excluded projects
+    before body title scanning, and caching only physical-stamp-bound title
+    hints with zero authorization state) so DeepSeek Harness participates in
+    tier-0 exact-title discovery and ranking identically to Codex, Codeg, and
+    Antigravity while preserving full `snapshot()` authorization, provenance,
+    revocation, and format fail-closed checks.
   - Eliminated double rollout scanning in `_legacy_record` by sharing the
     verified stamp from `transient_projection_iter` (`history.py`) and
     constructing full summaries only on verified matches.

@@ -90,6 +90,7 @@ class DeepSeekHistoryTests(unittest.TestCase):
         self.assertIsNone(decode_directory_id('report~002F~D83E'))
         self.assertIsNone(decode_directory_id('report~002f'))
         self.assertEqual([item.native_id for item in self.adapter.discover()], [native_id])
+        self.assertEqual([item.title for item in self.adapter.discover()], ['公开标题'])
         result = self.projection(native_id)
         self.assertEqual([(x.role, x.text, x.position, x.turn_id) for x in result.messages],
                          [('user', '用户问题', 'seq:1', '1'), ('assistant', '助手回复', 'seq:4', '1')])
@@ -234,6 +235,34 @@ class DeepSeekHistoryTests(unittest.TestCase):
         self.assertEqual(result.prefix, (location, len(data), result.revision))
         self.assertEqual([x.text for x in result.messages], ['retained'])
         self.assertEqual(result.warnings, ('incomplete_tail_omitted',))
+
+    def test_discovery_extracts_latest_committed_title_and_ignores_uncommitted_tail(self):
+        plain_loc = '--project-main--/renamed-plain/session.v4.jsonl'
+        plain_committed = records(
+            header('renamed-plain'),
+            event(0, 'session/title', {'title': '旧标题'}),
+            user(1, '提到 session/title 字样不应覆盖标题'),
+            event(2, 'session/title', {'title': '最终精确标题'}),
+        )
+        # Trailing incomplete session/title line without newline must not overwrite committed title.
+        self.write(plain_loc, plain_committed + '{"type":"session/title","seq":3,"time":1712345678903,"data":{"title":"未落盘'.encode('utf-8'))
+
+        zstd_loc = '--project-main--/renamed-zstd/session.v4.jsonl.zstd'
+        zstd_committed = (
+            frame(header('renamed-zstd'))
+            + frame(event(0, 'session/title', {'title': '压缩初版'}), user(1, '正文'))
+            + frame(event(2, 'session/title', {'title': '压缩终版'}))
+        )
+        torn_frame = frame(event(3, 'session/title', {'title': '残缺帧标题'}))[:-3]
+        self.write(zstd_loc, zstd_committed + torn_frame)
+
+        discovered = {item.native_id: item.title for item in self.adapter.discover()}
+        self.assertEqual(discovered['renamed-plain'], '最终精确标题')
+        self.assertEqual(discovered['renamed-zstd'], '压缩终版')
+        # Second call hits physical-stamp title cache cleanly; appending a new title invalidates cache.
+        self.assertEqual(self.adapter.describe('renamed-plain').title, '最终精确标题')
+        self.write(plain_loc, plain_committed + records(event(3, 'session/title', {'title': '追加改名标题'})))
+        self.assertEqual(self.adapter.describe('renamed-plain').title, '追加改名标题')
 
 
 if __name__ == '__main__':

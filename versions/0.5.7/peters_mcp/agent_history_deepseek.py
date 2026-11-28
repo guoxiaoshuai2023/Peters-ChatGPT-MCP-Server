@@ -10,6 +10,7 @@ import os
 from pathlib import Path
 import re
 import sys
+import threading
 
 if sys.version_info >= (3, 14):
     from compression import zstd
@@ -56,6 +57,10 @@ _MAX_CONTEXTS = 64
 _MAX_INTEGER = (1 << 53) - 1
 _ZSTD_MAGIC = b'\x28\xb5\x2f\xfd'
 _SESSION_SENDERS = frozenset(('agent-message', 'subagent-report', 'subagent-settled'))
+_TITLE_NEEDLES = (b'session/title', b'session\\/title', b'\\u00')
+_TITLE_CACHE = {}
+_TITLE_CACHE_LOCK = threading.Lock()
+_TITLE_CACHE_MAX = 2048
 
 
 def _unsupported():
@@ -207,10 +212,12 @@ class _FileCut:
         return digest.hexdigest()
 
 
-def _frames(source, cap):
+def _frames(source, cap, *, first_cap=None):
     """Yield complete frames and a None marker for a torn final frame."""
     pending = b''
+    frame_index = 0
     while pending or source.remaining:
+        limit = first_cap if (first_cap is not None and frame_index == 0) else cap
         if len(pending) < len(_ZSTD_MAGIC):
             pending += source.read()
         if len(pending) < len(_ZSTD_MAGIC):
@@ -230,16 +237,68 @@ def _frames(source, cap):
                     yield None
                     return
             try:
-                block = decoder.decompress(pending, min(_BLOCK, cap - len(frame) + 1))
+                block = decoder.decompress(pending, min(_BLOCK, limit - len(frame) + 1))
             except zstd.ZstdError:
                 raise _unsupported() from None
             pending = b''
             frame.extend(block)
-            if len(frame) > cap:
+            if len(frame) > limit:
                 raise _budget()
         pending = decoder.unused_data
         source.committed = source.stamp[1] - source.remaining - len(pending)
+        frame_index += 1
         yield frame
+
+
+def _frame_event_lines(frames):
+    for frame in frames:
+        if frame is None:
+            yield None
+            return
+        if not frame.endswith(b'\n'):
+            raise _unsupported()
+        start = 0
+        while start < len(frame):
+            end = frame.index(b'\n', start) + 1
+            yield frame[start:end]
+            start = end
+
+
+def _scan_committed_title(lines, initial_consumed):
+    """Extract the latest committed session/title hint without trusting unverified body lines."""
+    title = ''
+    consumed = initial_consumed
+    for seq, line in enumerate(lines):
+        if line is None:
+            break
+        consumed += len(line)
+        if consumed > _MAX_DECODED or seq >= _MAX_EVENTS:
+            break
+        if not any(needle in line for needle in _TITLE_NEEDLES):
+            continue
+        item = _record(line, _MAX_RECORD)
+        if (item.get('type') == 'session/title'
+                and not (item.keys() - _ROW_FIELDS)
+                and type(item.get('seq')) is int and item['seq'] == seq
+                and _version_number(item.get('time'))
+                and ('ignorable' not in item or item['ignorable'] is True)
+                and isinstance(item.get('data'), dict)
+                and _text(item['data'].get('title'), 4096)):
+            title = item['data']['title']
+    return title
+
+
+def _title_cache_get(key):
+    with _TITLE_CACHE_LOCK:
+        return _TITLE_CACHE.get(key)
+
+
+def _title_cache_put(key, title):
+    with _TITLE_CACHE_LOCK:
+        _TITLE_CACHE.pop(key, None)
+        while len(_TITLE_CACHE) >= _TITLE_CACHE_MAX:
+            _TITLE_CACHE.pop(next(iter(_TITLE_CACHE)))
+        _TITLE_CACHE[key] = title
 
 
 def _lines(source, compressed):
@@ -528,26 +587,70 @@ class Adapter:
             raise _unsupported()
         return actual[0] if actual else None
 
-    def _describe_at(self, location):
+    @staticmethod
+    def _header_selected(result, project_roots, explicit_ids, excluded_roots):
+        if project_roots is None and not excluded_roots:
+            return True
+        if result.native_id in explicit_ids:
+            return True
+        if project_roots is not None:
+            if not result.cwd:
+                return False
+            cwd_path = Path(result.cwd)
+            if not any(cwd_path.is_relative_to(root) for root in project_roots):
+                return False
+        if excluded_roots and result.cwd:
+            cwd_path = Path(result.cwd)
+            if any(cwd_path.is_relative_to(excluded) for excluded in excluded_roots):
+                return False
+        return True
+
+    @staticmethod
+    def _extract_title(path, cut, compressed, lines, initial_consumed):
+        cache_key = (path, cut.stamp, compressed)
+        cached = _title_cache_get(cache_key)
+        if cached is not None:
+            return cached
+        if cut.stamp[1] > _MAX_FILE:
+            return ''
+        try:
+            title = _scan_committed_title(lines, initial_consumed)
+        except AccessError as error:
+            if error.code == 'waiting_source_stable':
+                raise
+            return ''
+        _title_cache_put(cache_key, title)
+        return title
+
+    def _describe_at(self, location, *, project_roots=None, explicit_ids=(), excluded_roots=()):
         path, compressed = location
         with self.root.open(path) as stream:
             cut = _FileCut(stream)
             if compressed:
-                with closing(_frames(cut, _MAX_HEADER)) as frames:
+                with closing(_frames(cut, _MAX_FRAME, first_cap=_MAX_HEADER)) as frames:
                     first = next(frames, None)
-                if first is not None and first.count(b'\n') != 1:
-                    raise _unsupported()
+                    if first is not None and (not first.endswith(b'\n') or first.count(b'\n') != 1):
+                        raise _unsupported()
+                    result = _header(first, path, _iso(cut.stamp[2] // 1_000_000))
+                    if result.subagent or not self._header_selected(result, project_roots, explicit_ids, excluded_roots):
+                        cut.verify()
+                        return None
+                    title = self._extract_title(path, cut, True, _frame_event_lines(frames), len(first))
             else:
                 first = stream.readline(_MAX_HEADER + 1)
                 if len(first) > _MAX_HEADER:
                     raise _budget()
                 if not first.endswith(b'\n'):
                     first = None
-            result = _header(first, path, _iso(cut.stamp[2] // 1_000_000))
+                result = _header(first, path, _iso(cut.stamp[2] // 1_000_000))
+                if result.subagent or not self._header_selected(result, project_roots, explicit_ids, excluded_roots):
+                    cut.verify()
+                    return None
+                cut.remaining = max(0, cut.stamp[1] - len(first))
+                cut.committed = len(first)
+                title = self._extract_title(path, cut, False, _lines(cut, False), len(first))
             cut.verify()
-        if result.subagent:
-            return None
-        return Thread(result.native_id, updated_at=result.modified_at,
+        return Thread(result.native_id, title=title, updated_at=result.modified_at,
                       contexts=(result.cwd,) if result.cwd else (),
                       ancestors=(result.parent,) if result.parent else (),
                       agent='deepseek_harness', surface='local_session')
@@ -603,20 +706,15 @@ class Adapter:
                     continue
                 try:
                     location = self._unique_location(paths)
-                    thread = self._describe_at(location) if location is not None else None
+                    thread = (self._describe_at(location, project_roots=root_paths,
+                                                explicit_ids=explicit_ids,
+                                                excluded_roots=excluded_paths)
+                              if location is not None else None)
                 except AccessError:
                     unverifiable = True
                     continue
                 if thread is None:
                     continue
-                is_explicit = thread.native_id in explicit_ids
-                if not is_explicit:
-                    if not any(Path(context).is_relative_to(root)
-                               for context in thread.contexts for root in root_paths):
-                        continue
-                    if any(Path(context).is_relative_to(excluded)
-                           for context in thread.contexts for excluded in excluded_paths):
-                        continue
                 yield replace(thread, location=location[0])
             if not unverifiable:
                 self.project_partition_complete = True
@@ -643,12 +741,10 @@ class Adapter:
                     continue
                 try:
                     location = self._unique_location((f'{directory}/{native}',))
-                    thread = self._describe_at(location) if location is not None else None
+                    thread = (self._describe_at(location, excluded_roots=excluded_paths,
+                                                explicit_ids=explicit_ids)
+                              if location is not None else None)
                     if thread is not None:
-                        if thread.native_id not in explicit_ids and any(
-                                Path(context).is_relative_to(excluded)
-                                for context in thread.contexts for excluded in excluded_paths):
-                            continue
                         yield replace(thread, location=location[0])
                 except AccessError:
                     # A lossy slug cannot attribute a malformed header to a project.

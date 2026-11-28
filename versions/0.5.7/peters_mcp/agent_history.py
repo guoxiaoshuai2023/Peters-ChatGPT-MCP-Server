@@ -756,7 +756,9 @@ class AgentHistoryCore:
                     adapter, raw_candidates = self._discover(scope, name)
                     source = self._source(scope, name)
                     eligible = []
-                    for thread in raw_candidates:
+                    for disc_idx, thread in enumerate(raw_candidates):
+                        if disc_idx and disc_idx % 32 == 0:
+                            yield {"phase": "scanning"}
                         if not isinstance(thread, Thread) or not isinstance(thread.native_id, str) or not IDENTIFIER.fullmatch(thread.native_id):
                             continue
                         if unified(self.policy):

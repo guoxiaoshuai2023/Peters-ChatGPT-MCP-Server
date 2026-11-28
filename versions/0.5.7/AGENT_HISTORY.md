@@ -28,10 +28,12 @@ revocation, or coverage-honesty invariant:
    (`index_step_count < db_steps_count`) to retryable `waiting_source_stable`;
    and adds local-only structural rejection sites to `inspect_native`
    (`Assessment.detail`) without exposing internal structure over MCP.
-2. **Two-phase unified `find_agent_threads` & concurrent worker non-blocking**:
+2. **Two-phase unified `find_agent_threads` across all four sources & concurrent worker non-blocking**:
    Aligns `v1` and `v2` search under a tiered title-first (exact normalized
    title ahead of substring title, multi-token title, and body hits across
-   direct and aggregate search), decoupled bounded body-scan pipeline
+   direct and aggregate search for Codex, Antigravity, Codeg, and DeepSeek
+   Harness — including committed `session/title` discovery extraction for
+   plain and `.zstd` DeepSeek v4 logs), decoupled bounded body-scan pipeline
    (eliminating the `v1`-only 25-second hard cutoff, `MAX_SEARCH` and
    similar-suffix title starvation on 300+ thread projects, and double Codex
    rollout scanning), raises per-source worker task concurrency to 3 with

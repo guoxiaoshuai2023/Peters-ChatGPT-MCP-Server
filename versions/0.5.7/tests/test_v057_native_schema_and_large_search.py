@@ -32,6 +32,7 @@ from starlette.testclient import TestClient
 
 from peters_mcp.agent_history import AgentHistoryCore, MAX_SEARCH
 from peters_mcp.agent_history_admin import activate_preview, preview_activation, write_descriptor
+from peters_mcp.agent_history_deepseek import _project_key as deepseek_project_key
 from peters_mcp.agent_history_generation import initialize_store
 from peters_mcp.agent_history_policy import AgentPolicy
 from peters_mcp.agent_history_service import AgentHistoryService
@@ -42,6 +43,7 @@ from peters_mcp.file_context import actor_digest
 from peters_mcp.fs_identity import persistent_identity
 from peters_mcp.history import HistoryAccess
 from tests import test_agent_history_antigravity_native as native
+from tests import test_agent_history_deepseek as deepseek
 from tests.test_agent_history_antigravity_native import (
     FIRST, SECOND, SECONDS, SESSION, TRAJECTORY, desktop_spec, message, varint,
 )
@@ -970,6 +972,216 @@ class LargeProjectTwoPhaseSearchAndConcurrencyTests(unittest.TestCase):
                     self.assertGreaterEqual(len(mild['threads']), 2, mild)
                     self.assertEqual(mild['threads'][0]['title'], mild_title)
                     self.assertEqual(mild['threads'][0]['match'], {'in': 'title', 'mode': 'substring'})
+
+    def test_deepseek_v4_exact_native_title_reachable_across_320_sessions_and_280_similar_suffixes(self):
+        dsh_root = self.base / 'deepseek-root'
+        dsh_root.mkdir(mode=0o700)
+        exact_title = '合成深度检索精确标题'
+        alpha_slug = deepseek_project_key(str(self.alpha))
+        beta_slug = deepseek_project_key(str(self.beta))
+        now_ms = time.time_ns() // 1_000_000
+        now_sec = time.time()
+
+        def write_dsh(slug, cwd, native_id, title, user_text, reply_text, mtime_sec, *,
+                      compressed=False, rename_from=None):
+            folder = dsh_root / slug / native_id
+            folder.mkdir(parents=True, exist_ok=True)
+            hdr = {**deepseek.header(native_id, str(cwd)), 'createdAt': now_ms}
+            seq = 0
+            ev = []
+            if rename_from:
+                ev.append({**deepseek.event(seq, 'session/title', {'title': rename_from}), 'time': now_ms + seq})
+                seq += 1
+            ev.append({**deepseek.event(seq, 'turn/start', {'turn': 1}), 'time': now_ms + seq})
+            seq += 1
+            ev.append({**deepseek.user(seq, user_text), 'time': now_ms + seq})
+            seq += 1
+            ev.append({**deepseek.assistant(seq, reply_text), 'time': now_ms + seq})
+            seq += 1
+            ev.append({**deepseek.event(seq, 'session/title', {'title': title}), 'time': now_ms + seq})
+            seq += 1
+            ev.append({**deepseek.event(seq, 'turn/end', {'turn': 1, 'reason': {'kind': 'completed'}}), 'time': now_ms + seq})
+            if compressed:
+                target = folder / 'session.v4.jsonl.zstd'
+                target.write_bytes(deepseek.frame(hdr) + deepseek.frame(*ev))
+            else:
+                target = folder / 'session.v4.jsonl'
+                target.write_bytes(deepseek.records(hdr, *ev))
+            os.utime(target, (mtime_sec, mtime_sec))
+
+        def make_dsh_http(mode):
+            settings = AccessSettings(
+                'https://test-team.cloudflareaccess.com', 'a' * 64,
+                'mcp.example.com', ('owner@example.com',),
+            )
+            key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+            now = int(time.time())
+            token = jwt.encode(
+                {'iss': settings.team_domain, 'aud': [settings.audience], 'iat': now - 1,
+                 'exp': now + 300, 'email': 'owner@example.com', 'sub': 'owner'},
+                key, algorithm='RS256', headers={'kid': 'v057-dsh-key'},
+            )
+            actor = actor_digest(settings.team_domain, 'owner')
+            if mode == 'v1':
+                cdir = Path(tempfile.mkdtemp(dir=self.base, prefix='dsh-v1-'))
+                os.chmod(cdir, 0o700)
+                proj_cfg = cdir / 'projects.json'
+                proj_cfg.write_text(json.dumps({'projects': [
+                    {'id': 'alpha', 'name': 'Alpha', 'root': str(self.alpha)},
+                    {'id': 'beta', 'name': 'Beta', 'root': str(self.beta)},
+                ]}))
+                pol_cfg = cdir / 'agent-policy.json'
+
+                def write_v1(denied=()):
+                    pol_cfg.write_text(json.dumps({
+                        'version': 1,
+                        'sources': {
+                            'deepseek': {
+                                'adapter': 'deepseek_harness', 'root': str(dsh_root), 'format': '0.2.2-rc.3',
+                                'enabled': True, 'inherit_projects': True, 'actors': {actor: ['alpha', 'beta']},
+                                'denied_threads': list(denied), 'threads': {},
+                            },
+                        },
+                    }))
+
+                write_v1()
+                app = build_app(Catalog.from_config(proj_cfg), settings, agent_policy=AgentPolicy(pol_cfg))
+                update_denied = write_v1
+            else:
+                cdir = Path(tempfile.mkdtemp(dir=self.base, prefix='dsh-v2-'))
+                os.chmod(cdir, 0o700)
+                store = initialize_store(cdir / 'generations')
+                desc = cdir / 'policy.json'
+
+                def write_v2(denied=()):
+                    doc = {
+                        'version': 2,
+                        'projects': [
+                            {'id': 'alpha', 'name': 'Alpha', 'root': str(self.alpha),
+                             'directory_identity': persistent_identity(self.alpha)},
+                            {'id': 'beta', 'name': 'Beta', 'root': str(self.beta),
+                             'directory_identity': persistent_identity(self.beta)},
+                        ],
+                        'sources': {
+                            'deepseek': {
+                                'adapter': 'deepseek_harness', 'root': str(dsh_root), 'format': '0.2.2-rc.3',
+                                'enabled': True, 'instance_id': 'dsh-inst',
+                                'root_identity': persistent_identity(dsh_root),
+                                'denied_threads': list(denied),
+                            },
+                        },
+                        'legacy_history': None,
+                    }
+                    pv, dg = preview_activation(doc, previous=store.snapshot() if desc.exists() else None)
+                    activate_preview(store, pv, dg, initial=not desc.exists())
+                    if not desc.exists():
+                        write_descriptor(desc, store)
+
+                write_v2()
+                policy = AgentPolicy(desc, mode='v2')
+                scratch = cdir / 'scratch'
+                scratch.mkdir(mode=0o700)
+                policy.scratch = scratch
+                app = build_app(Catalog.from_policy(policy), settings, agent_policy=policy)
+                update_denied = write_v2
+            app.verifier.keys = Mock()
+            app.verifier.keys.get_signing_key_from_jwt.return_value = SimpleNamespace(key=key.public_key())
+            return app, token, update_denied
+
+        # Part 1: Single session -> add 319 unrelated newer sessions in same process -> exact title still #1.
+        target_id = 'dsh-target-000'
+        write_dsh(
+            alpha_slug, self.alpha, target_id, exact_title,
+            '合成用户提问不含标题短语', '合成助手回答确认双消息一致',
+            now_sec - 10_000, compressed=True, rename_from='已更名旧标题',
+        )
+        app_v2, token_v2, update_denied_v2 = make_dsh_http('v2')
+        with TestClient(app_v2, base_url='https://mcp.example.com') as client:
+            before = self._run_tool_ready(client, token_v2, 'find_agent_threads', {
+                'project_id': 'alpha', 'source_id': 'deepseek', 'query': exact_title, 'limit': 10,
+            })
+            self.assertEqual(before['status'], 'ready', before)
+            self.assertEqual(len(before['threads']), 1, before)
+            orig_ref = before['threads'][0]['thread_ref']
+            self.assertEqual(before['threads'][0]['title'], exact_title)
+
+            # Grow project by 319 newer completely unrelated sessions + 5 foreign beta sessions with same exact title.
+            for idx in range(319):
+                write_dsh(
+                    alpha_slug, self.alpha, f'dsh-unrel-{idx:03d}', f'完全无关合成会话 {idx:03d}',
+                    f'常规问答 {idx:03d}', f'常规答复 {idx:03d}',
+                    now_sec - 100 - idx, compressed=(idx < 20),
+                )
+            for bidx in range(5):
+                write_dsh(
+                    beta_slug, self.beta, f'dsh-beta-{bidx:03d}', exact_title,
+                    '跨项目隔离用户正文', '跨项目隔离助手正文', now_sec - bidx,
+                )
+
+            after_unrel = self._run_tool_ready(client, token_v2, 'find_agent_threads', {
+                'project_id': 'alpha', 'source_id': 'deepseek', 'query': exact_title, 'limit': 10,
+            })
+            self.assertEqual(after_unrel['status'], 'ready', after_unrel)
+            self.assertEqual(len(after_unrel['threads']), 1, after_unrel)
+            self.assertEqual(after_unrel['threads'][0]['title'], exact_title)
+            self.assertEqual(after_unrel['threads'][0]['project_id'], 'alpha')
+            self.assertFalse(after_unrel['coverage_complete'])
+            self.assertIn('resource_exhausted', after_unrel['coverage'][0]['warnings'])
+
+            # Both fresh ref and preserved pre-growth ref read the exact same two messages.
+            for ref in (after_unrel['threads'][0]['thread_ref'], orig_ref):
+                read = self._run_tool_ready(client, token_v2, 'read_agent_thread', {
+                    'thread_ref': ref, 'view': 'latest_turn',
+                })
+                self.assertEqual(read['status'], 'ready', read)
+                self.assertEqual([e['text'] for e in read['entries']],
+                                 ['合成用户提问不含标题短语', '合成助手回答确认双消息一致'])
+
+        # Part 2: Replace 280 of the newer sessions with similar-suffix titles -> exact title MUST rank #1 across v1/v2 & aggregate!
+        for idx in range(280):
+            write_dsh(
+                alpha_slug, self.alpha, f'dsh-unrel-{idx:03d}', f'{exact_title} - 相似后缀 {idx:03d}',
+                f'后缀问答 {idx:03d}', f'后缀答复 {idx:03d}',
+                now_sec - idx, compressed=(idx < 20),
+            )
+
+        for mode, source_id in (('v1', 'deepseek'), ('v2', 'deepseek'), ('v1', ''), ('v2', '')):
+            with self.subTest(mode=mode, source_id=source_id or 'aggregate'):
+                app, token, update_denied = make_dsh_http(mode)
+                with TestClient(app, base_url='https://mcp.example.com') as client:
+                    args = {'project_id': 'alpha', 'query': exact_title, 'limit': 10}
+                    if source_id:
+                        args['source_id'] = source_id
+                    found = self._run_tool_ready(client, token, 'find_agent_threads', args)
+                    self.assertEqual(found['status'], 'ready', found)
+                    self.assertGreaterEqual(len(found['threads']), 1, found)
+                    hit = found['threads'][0]
+                    self.assertEqual(hit['title'], exact_title)
+                    self.assertEqual(hit['project_id'], 'alpha')
+                    self.assertEqual(hit['match'], {'in': 'title', 'mode': 'substring'})
+                    self.assertTrue(all(row['project_id'] == 'alpha' for row in found['threads']))
+                    self.assertFalse(found['coverage_complete'])
+                    dsh_cov = [c for c in found['coverage'] if c['source_id'] == 'deepseek']
+                    self.assertEqual(len(dsh_cov), 1)
+                    self.assertIn('resource_exhausted', dsh_cov[0]['warnings'])
+
+                    latest = self._run_tool_ready(client, token, 'read_agent_thread', {
+                        'thread_ref': hit['thread_ref'], 'view': 'latest_turn',
+                    })
+                    self.assertEqual(latest['status'], 'ready', latest)
+                    self.assertEqual([e['text'] for e in latest['entries']],
+                                     ['合成用户提问不含标题短语', '合成助手回答确认双消息一致'])
+
+                    if mode == 'v2' and source_id == 'deepseek':
+                        # Revocation must fail closed immediately for both search and read.
+                        update_denied(denied=(target_id,))
+                        revoked = self._run_tool_ready(client, token, 'read_agent_thread', {
+                            'thread_ref': hit['thread_ref'], 'view': 'latest_turn',
+                        })
+                        self.assertNotIn('合成助手回答确认双消息一致', json.dumps(revoked, ensure_ascii=False))
+                        after_revoke = self._run_tool_ready(client, token, 'find_agent_threads', args)
+                        self.assertEqual(after_revoke['status'], 'ready')
+                        self.assertNotIn(exact_title, [r['title'] for r in after_revoke['threads']])
 
 
 if __name__ == '__main__':
